@@ -1,0 +1,21 @@
+{
+  "kind": "univ4_hook",
+  "hook": {
+    "contract": "BuyGateHook",
+    "constructorArgs": ["$poolManager"],
+    "permissions": ["beforeInitialize", "beforeSwap", "afterSwap"]
+  },
+  "token": {
+    "contract": "SurfToken",
+    "name": "SurfSurf",
+    "symbol": "SURF",
+    "decimals": 18
+  },
+  "pool": {
+    "pairedCurrency": "0x0000000000000000000000000000000000000000",
+    "fee": 3000,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "notes": "BuyGateHook governs one native ETH/SURF pool, with ETH as currency0 and SurfToken as currency1. Initial sqrtPriceX96 is 2^96, choosing the 1:1 raw-unit ratio used in the repository's pool tests. beforeInitialize accepts only fee 3000 and tick spacing 60 with native ETH, binds the first pool, and sets genesis; subsequent initialization is refused. All enabled callbacks require the configured PoolManager. The hook address must encode these permissions (8384 / 0x20c0). Buys exchange ETH for SURF and are always permitted by the hook. Sells are otherwise closed. Days are 86400 seconds from genesis, not UTC midnight. Holders approve and deposit SURF, then vote once per address per day with their deposited balance at vote time; voting locks withdrawals until that day ends. The implementation interprets the voting requirement as both yes > no and yes + no >= quorum. Quorum is floor(5% of circulating supply), snapshotted at the day's first vote; circulating supply is totalSupply minus the PoolManager's SURF balance. No votes or a tie fails. A passing day d vote opens sells only during the first 3600 seconds of day d+1; day 0 has no sell window. The aggregate sell allowance is floor(50% of the previous day's actual SURF buy output), shared first come, first served. Unused allowance does not carry over; current-day buys count toward the next day. beforeSwap gates sells and rejects exact-input amounts above the remaining allowance. afterSwap records actual buy output and sell input and reverts any sell exceeding the cap, including exact-output sells. Deposits and withdrawals do not count as swaps. The hook charges no fee, overrides no LP fee, and returns zero swap deltas; all return-delta permissions are disabled. The ordinary 0.3% pool LP fee goes to liquidity providers. Nothing is routed to surfsurf.eth. No administrator, parameter setters, pause or upgrade mechanism exists. These restrictions govern swaps in this pool; token transfers, other markets, and liquidity additions or removals are not restricted. SurfToken takes no constructor arguments."
+}
