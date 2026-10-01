@@ -54,18 +54,21 @@ SURF input is known. Buys made during the window count towards the next day, not
 buy walks the price down through it and converts its SURF into the buyer's ETH, and the position's owner
 then removes it and holds ETH. On an open pool any holder could do that on day 0 with no vote, no window
 and no cap, and could also buy from their own position to inflate `bought` and with it the next day's
-allowance. So `beforeAddLiquidity` accepts a position only from the launch. An add passes when any of
+allowance. So `beforeAddLiquidity` accepts a position only from the launch. An add passes when either of
 these holds, and is refused with `LiquidityNotFromLaunch(sender)` otherwise:
 
 - it happens in the transaction that initialized the pool (the factory initializes and seeds in one
   transaction, through whatever router it likes; the hook marks that transaction in transient storage);
-- `sender` is the account that called `initialize` (`initializer()`), acting as its own router;
 - the pool has never held a position (`seeded()` is false): the first position ever is the seed.
 
-Every accepted add sets `seeded`, which closes the third case for good. The hook cannot tell the users of a
-shared router apart (the `sender` it sees is the router), so after the seed the launch can add more only
-from its own address or in the initialization transaction, not through a public position manager.
-Removing liquidity is not restricted: only the launch can hold a position, and it may unwind it.
+Every accepted add sets `seeded`, which closes the second case for good. After that nobody can add, the
+launch included. The rule deliberately ignores the `sender` the hook is shown: that is the router that
+called the PoolManager, not the end user, and the hook cannot tell a router's users apart. In particular
+the router that called `initialize` (recorded as `initializer()`, for reference only) earns no rights: if
+the launch initializes through a position manager or a factory with a public liquidity entry point, every
+user of that contract would otherwise pass the gate. The independent review of 2026-10-01 showed exactly
+that with the previous rule, which admitted the initializer; see `REVIEW.md` item 14. Removing liquidity
+is not restricted: only the launch can hold a position, and it may unwind it.
 
 **Fees.** The hook charges nothing, overrides no LP fee and returns no deltas. The pool uses the standard
 static 0.3% LP fee (`fee = 3000`, `tickSpacing = 60`), which accrues to liquidity providers exactly as on any
@@ -118,10 +121,11 @@ The brief leaves these open; this is what was built.
   the factory deploys the hook and initializes the pool in one transaction; a hook left deployed and
   unbound could be bound to another token by anyone. The launch must keep deployment and initialization
   atomic.
-- **The seed should be in the initialization transaction.** If the factory seeds in a later transaction,
-  the first position to arrive is accepted whoever sends it (`seeded()` is still false), and the launch
-  would have to add its own liquidity as its own router afterwards. Seeding in the initialization
-  transaction leaves no such gap.
+- **The seed must be in the initialization transaction.** If the factory seeds in a later transaction,
+  the first position to arrive is accepted whoever sends it (`seeded()` is still false), and after it
+  nobody can add, the launch included: a front-runner's dust position would leave the pool unseedable and
+  the launch would have to redeploy. Seeding in the initialization transaction leaves no such gap, and
+  the whole seed has to go in then, since there is no later add path for anyone.
 
 ## What the hook cannot do
 
@@ -170,7 +174,8 @@ Constants:
 
 State and views:
 
-- `poolManager()`, `poolId()`, `token()`, `genesis()`, `initializer()`, `seeded()`
+- `poolManager()`, `poolId()`, `token()`, `genesis()`, `initializer()` (the router that called
+  `initialize`, informational, no rights), `seeded()`
 - `records(day)` → `(yes, no, quorum, hasVotes, bought, sold)`
 - `stakeOf(voter)`, `lockedUntil(voter)`, `hasVoted(voter, day)` (true for every day the voter voted on)
 - `currentDay()`, `dayStart(day)`, `circulatingSupply()`
@@ -245,7 +250,7 @@ administers it.
 | Token | `SurfToken`, no constructor arguments, supply `10^27` minted to the deployer (the factory) |
 | Hook | `BuyGateHook`, constructor `["$poolManager"]`, CREATE2 salt mined for flags `0x28C0` (decimal 10432) |
 | Pool | `currency0` = native ETH (`address(0)`), `currency1` = SURF, `fee` 3000, `tickSpacing` 60, `hooks` = the hook |
-| Liquidity | seeded by the factory in the initialization transaction (any router), or later by the initializer acting as its own router |
+| Liquidity | seeded in full by the factory in the initialization transaction (any router); no add is possible afterwards, by anyone |
 | Launch target | Sepolia (11155111) unless the launch says otherwise; the script also accepts 31337 |
 | Hook fee / recipient | none / surfsurf.eth receives nothing because nothing is charged |
 | Admin | none |
@@ -260,7 +265,10 @@ The pool's token side can be seeded alone (a range below the current price, e.g.
 1:1 start). Buys work on such a pool with no ETH in the manager; `test_buyWorksOnATokensOnlyPool` covers it.
 Seed in the same transaction as `initialize`: that transaction may add any number of positions through
 any router (`test_launchSeedsSeveralPositionsInTheInitializationTransaction`). A seed in a later
-transaction is accepted only as the pool's very first position, from whoever sends it first.
+transaction is accepted only as the pool's very first position, from whoever sends it first, and nothing
+can be added after it. It does not matter which contract calls `initialize`: a shared router such as a
+position manager is fine, because its later callers are refused like everyone else
+(`test_usersOfTheRouterThatInitializedThePoolAreRefusedAfterTheSeed`).
 
 ### Rehearsal script
 
@@ -304,8 +312,10 @@ Tests (`test/`):
 - `SurfToken.t.sol` – supply, decimals, transfer, no admin entry points, fuzzed conservation.
 - `BuyGateHook.t.sol` – real PoolManager and v4 test routers: flags and permissions, caller checks,
   initialization guards, buys (exact in/out, tokens-only pool), the liquidity rule (third-party adds
-  refused, the single-sided exit and the self-liquidity wash from the independent review, a mock factory
-  that initializes and seeds in one transaction, first-position seed, launch removal, fuzzed ranges),
+  refused, the single-sided exit and the self-liquidity wash from the independent review, a launch that
+  initializes and seeds through a shared router whose other users are then refused, a mock factory that
+  initializes and seeds in one transaction and is itself refused later, first-position seed, launch
+  removal, fuzzed ranges),
   closed sells, deposit/withdraw/lock, vote mechanics, the vote refused inside an unlock, `hasVoted` across
   days, quorum snapshot, majority/quorum outcomes, the one-hour window, the 50% cap for exact-in and
   exact-out sells, carry-over, repeated days, and fuzz over amounts, timing and vote weights.
@@ -325,11 +335,11 @@ Tests (`test/`):
   sell should request no more than `sellRemaining()`; exact-output sells may revert in `afterSwap` if the
   input turns out larger.
 - **The deployer** supplies the chain's PoolManager and mines the salt for flags `0x28C0`. Deployment,
-  initialization and the liquidity seed belong in one transaction (see "Deployment parameters"). Nothing
-  else is configurable, and nothing can be changed afterwards.
-- **The launch** is the only liquidity provider. It should hold its positions through a router it controls
-  (or its own address) and expect `LiquidityNotFromLaunch` if it later tries to add through a public
-  position manager, since the hook cannot distinguish that router's users.
+  initialization and the whole liquidity seed belong in one transaction (see "Deployment parameters").
+  Nothing else is configurable, and nothing can be changed afterwards.
+- **The launch** is the only liquidity provider, and only ever at the seed. It must size the seed once:
+  every later add, from any address and through any router (the one that initialized the pool included),
+  reverts with `LiquidityNotFromLaunch`. It may remove liquidity at any time, but cannot put it back.
 - **Nobody** holds keys to this system. There is no pause and no rescue function; SURF deposited for voting
   can only be withdrawn by its depositor.
 

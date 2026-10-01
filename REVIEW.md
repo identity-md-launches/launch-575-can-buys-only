@@ -1,19 +1,20 @@
 # Review notes: SurfToken and BuyGateHook
 
 A self-review against the task's security references (the v4 hook security checklist and the ethskills
-safety checklist) before hand-off, updated after the independent review of 2026-10-01. It is not an audit;
-the launch's separate adversarial review decides admission.
+safety checklist) before hand-off, updated after the independent reviews of 2026-10-01 (two rounds). It is
+not an audit; the launch's separate adversarial review decides admission.
 
 ## What was re-run
 
 | Check | Result |
 | --- | --- |
 | `forge build --offline` | compiles, solc 0.8.26, no errors |
-| `forge test --offline` | 56 tests pass (6 token, 47 hook, 3 script), 256 fuzz runs each |
+| `forge test --offline` | 57 tests pass (6 token, 48 hook, 3 script), 256 fuzz runs each |
 | `forge fmt --check` | clean |
 | `EXPECTED_CHAIN_ID=0 forge script script/Deploy.s.sol:Deploy --offline` | runs, hook lands on an address ending in flags `0x28C0` |
 | Pinned `Hook.protected.t.sol` and `Token.protected.t.sol` (run from `test/scratch` with the built creation code, flags 10432) | all pass |
-| The three reviewer proofs, re-mined for flags `0x28C0` (copies under `test/scratch`) | 3 of 3 pass; the originals fail in `setUp` because they mine the pre-fix flag set, see finding 7 |
+| The three first-round reviewer proofs, re-mined for flags `0x28C0` (copies under `test/scratch`) | 3 of 3 pass; the originals fail in `setUp` because they mine the pre-fix flag set, see finding 7 |
+| The second-round proof `Proof_d3f53da61d26.t.sol` (copy under `test/scratch`, unchanged) | failed on the previous tree (alice gained 1,003 ETH); passes now (her add is refused, 0 ETH gained) |
 
 ## Checklist walk-through
 
@@ -31,11 +32,12 @@ positions. No `*ReturnDelta` flag is set, so the NoOp vector does not exist. `be
 **Delta accounting.** The hook never calls `take`, `settle`, `mint` or `burn` on the manager. Deltas always
 sum to zero because the hook adds nothing to them.
 
-**Sender identity.** The `sender` parameter (the router) is used in exactly two places: `beforeInitialize`
-records it as the launch (`initializer`), and `beforeAddLiquidity` compares against it. Swaps remain
-global to the pool, so no router allowlist is needed for trading. The limitation that a shared router's
-users are indistinguishable is documented; it is why the launch must seed in the initialization
-transaction or add as its own router.
+**Sender identity.** The `sender` parameter (the router) is never used to grant anything. `beforeInitialize`
+records it (`initializer`) for reference and the `PoolBound` event; `beforeAddLiquidity` only echoes it in
+the `LiquidityNotFromLaunch` error. The liquidity gate is keyed on the transaction (transient flag set by
+`beforeInitialize`) and on `seeded`, both independent of who the router is. Swaps remain global to the
+pool, so no router allowlist is needed for trading. A shared router's users are indistinguishable, which
+is why no router, the initializing one included, is trusted after the seed (item 14).
 
 **Reentrancy.** The swap callbacks make no external calls. `deposit` and `withdraw` update state before the
 token transfer (checks-effects-interactions). `vote` reads `totalSupply` and `balanceOf` on the launch
@@ -59,22 +61,22 @@ cannot overflow.
 skew can shift a window edge by that much, which is stated in the README.
 
 **Access control.** There are no privileged functions. "Who can change it: no one" holds by construction.
-The `initializer` is not an admin: it may only add liquidity, which it could do anyway as the launch.
+The `initializer` is not an admin and, since item 14, holds no right at all: it is a recorded address.
 
 **No hardcoded addresses.** The PoolManager is a constructor argument; the token is read from the pool key
 at initialization; the launch is read from the `initialize` call.
 
 **Gas.** `beforeSwap` on a buy is one `SLOAD` (`genesis`) plus the modifier; on a sell it reads a handful of
-slots. `afterSwap` writes one slot. `beforeAddLiquidity` is one `TLOAD` and two `SLOAD`s, plus one `SSTORE`
-on the first ever add. No loops in any callback.
+slots. `afterSwap` writes one slot. `beforeAddLiquidity` is two `SLOAD`s and at most one `TLOAD`, plus one
+`SSTORE` on the first ever add. No loops in any callback.
 
 **Escape hatches.** No `DELEGATECALL`, `CALLCODE` or `SELFDESTRUCT` in either runtime
 (`test_runtimeCodeHasNoEscapeHatch`, and the pinned token test).
 
 ## Findings and dispositions
 
-Items 1 to 6 are from the first self-review; items 7 to 12 come from the independent review and were
-reproduced here before anything changed.
+Items 1 to 6 are from the first self-review; items 7 to 13 come from the first independent review and
+item 14 from the second. Every reviewer finding was reproduced here before anything changed.
 
 1. **Quorum snapshot timing is chosen by the first voter (low).** The first `vote` of a day fixes the
    quorum from circulating supply at that moment. Circulating supply can only rise during a day after the
@@ -94,7 +96,7 @@ reproduced here before anything changed.
    position just below the price is a resting sell order that any buy fills, so any holder could exit to
    ETH on day 0 with no vote, no window and no cap, and could inflate `bought` by buying from their own
    position. Disposition: fixed. `beforeAddLiquidity` is enabled and accepts a position only in the
-   initialization transaction, from the initializer, or as the pool's first position. See item 7.
+   initialization transaction or as the pool's first position. See items 7 and 14.
 
 5. **Deposited SURF is custodied by the hook (low).** `withdraw` is the only way out and only the depositor
    can call it; there is no admin sweep. Fuzz `testFuzz_depositsAreAlwaysRecoverable` checks every deposit
@@ -149,12 +151,32 @@ reproduced here before anything changed.
     the factory deploys the hook and initializes the pool in one transaction; the README records this as a
     deployment guarantee the launch must keep.
 
+14. **The liquidity gate trusted the router that called `initialize` (medium, second review, fixed).**
+    The first fix of item 7 admitted any later position whose `sender` equalled `initializer`, the contract
+    that called `PoolManager.initialize`. That contract is a router, not a person: if the launch initializes
+    through anything other people can also drive (PositionManager's `initializePool` then
+    `modifyLiquidities`, a factory with a public liquidity entry point), every position forwarded by it
+    passes, and the resting-sell-order exit of item 7 is open again. Reproduced with the reviewer's proof:
+    a launch that initialized and seeded through a shared router, then a stranger's SURF-only position
+    through the same router was accepted, a buy filled it, and the stranger removed it holding about
+    1,003 ETH with sells closed and nothing recorded. Fix: the `sender == initializer` clause is gone.
+    `beforeAddLiquidity` now accepts a position only in the initialization transaction or as the pool's
+    first position; after the seed nobody can add, the launch included, through any router. `initializer`
+    stays as a recorded address with no rights. The reviewer's proof passes unchanged (the stranger's add
+    reverts `LiquidityNotFromLaunch`, 0 ETH gained);
+    `test_usersOfTheRouterThatInitializedThePoolAreRefusedAfterTheSeed` keeps the scenario in the suite,
+    and `test_launchSeedsSeveralPositionsInTheInitializationTransaction` now checks that the factory's
+    own later add is refused too. Consequence for the launch: the seed has to be complete in the
+    initialization transaction, since there is no later add path; a seed in a later transaction is still
+    accepted as the first position but is exposed to a front-runner's dust position, which would leave
+    the pool unseedable (documented, README "The seed must be in the initialization transaction").
+
 ## Open items for the launch
 
 - The launch manifest must pass `["$poolManager"]` as the hook's constructor arguments, flags `10432`
   (`0x28C0`), the pool key with native ETH as `currency0`, fee `3000`, tick spacing `60`.
-- The factory must deploy the hook, initialize the pool and seed liquidity in one transaction. Any
-  position added in that transaction, through any router, is accepted; afterwards only the initializer as
-  its own router may add.
+- The factory must deploy the hook, initialize the pool and seed all of its liquidity in one transaction.
+  Any position added in that transaction, through any router, is accepted; afterwards nobody may add,
+  whatever contract called `initialize`.
 - Explorer verification and the fork rehearsal belong to the network's deployer.
 - Slither and Mythril were not available in this environment and were not run.

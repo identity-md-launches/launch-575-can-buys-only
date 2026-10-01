@@ -38,9 +38,11 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 /// Liquidity is the launch's alone. A position just below the price is a resting sell order that a buy
 /// fills, so an open pool would let any holder turn tokens into ETH with no vote, no window and no cap,
 /// and would let a holder inflate "bought" by buying from their own position. `beforeAddLiquidity`
-/// therefore accepts a position only from the launch: during the transaction that initialized the pool,
-/// from the account that initialized it, or as the pool's very first position. Removing liquidity is not
-/// restricted: only the launch can have any.
+/// therefore accepts a position only during the transaction that initialized the pool, or as the pool's
+/// very first position. It never trusts the `sender` it is shown: that is the router that called the
+/// manager, not the end user, and a router the launch used may be one anyone can drive (a position
+/// manager, a factory with a public liquidity entry point). Removing liquidity is not restricted: only
+/// the launch can have any.
 ///
 /// The hook charges nothing, overrides no LP fee and returns no deltas. The pool keeps its ordinary
 /// 0.3% LP fee (`fee` 3000, `tickSpacing` 60), which goes to liquidity providers as on any pool. Nobody can
@@ -96,10 +98,12 @@ contract BuyGateHook is IHooks {
     /// @notice The timestamp the governed pool was initialized at; day 0 starts here.
     uint256 public genesis;
 
-    /// @notice The account that initialized the pool (the launch); it may add liquidity at any time.
+    /// @notice The router that called `initialize` for the governed pool, recorded for reference only.
+    /// @dev It grants nothing: a router's later calls may come from anyone, so the liquidity gate ignores it.
     address public initializer;
 
-    /// @notice True once the pool holds its first position. From then on only the launch may add.
+    /// @notice True once the pool holds its first position. From then on, adds are accepted only in the
+    /// initialization transaction, which has already ended.
     bool public seeded;
 
     /// @notice Everything the hook tracks about one day.
@@ -206,7 +210,7 @@ contract BuyGateHook is IHooks {
     /// @dev Binds the hook to its one pool. The pool must pair native ETH (`currency0`) with the token
     /// (`currency1`) at the standard 0.3% static fee and tick spacing 60. A second initialization is
     /// refused, so no other pool can ever share this hook's accounting. The caller of `initialize` is
-    /// recorded as the launch, and the rest of this transaction is marked as the initialization
+    /// recorded for reference, and the rest of this transaction is marked as the initialization
     /// transaction, during which any router may seed liquidity.
     function beforeInitialize(address sender, PoolKey calldata key, uint160) external onlyPoolManager returns (bytes4) {
         if (genesis != 0) revert AlreadyBound();
@@ -228,18 +232,19 @@ contract BuyGateHook is IHooks {
     }
 
     /// @inheritdoc IHooks
-    /// @dev Only the launch may add liquidity. A position is accepted when any of these hold:
+    /// @dev Only the launch may add liquidity. A position is accepted when either of these hold:
     ///   - the call is in the transaction that initialized the pool (the factory seeds right after it);
-    ///   - `sender` is the account that initialized the pool, acting as its own router;
     ///   - the pool has never held a position (the seed arrives in a later transaction).
-    /// Every accepted position marks the pool as seeded, which closes the third case for good.
+    /// Every accepted position marks the pool as seeded, which closes the second case for good. `sender`
+    /// is deliberately not consulted: it names the router, and the users of a shared router (the one that
+    /// called `initialize` included) cannot be told apart, so a rule keyed on it would admit everyone.
     function beforeAddLiquidity(address sender, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata)
         external
         onlyPoolManager
         returns (bytes4)
     {
         if (genesis == 0) revert NotBound();
-        if (!_inInitializationTransaction() && sender != initializer && seeded) revert LiquidityNotFromLaunch(sender);
+        if (seeded && !_inInitializationTransaction()) revert LiquidityNotFromLaunch(sender);
         if (!seeded) {
             seeded = true;
             emit Seeded(sender);

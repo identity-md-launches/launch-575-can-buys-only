@@ -65,6 +65,16 @@ contract FlashVoter is IUnlockCallback {
     }
 }
 
+/// @notice A liquidity router anyone can call that also initializes pools, the way PositionManager's
+/// `initializePool` does. Models a launch that goes through shared infrastructure.
+contract SharedLaunchRouter is PoolModifyLiquidityTest {
+    constructor(IPoolManager m) PoolModifyLiquidityTest(m) {}
+
+    function initializePool(PoolKey calldata key, uint160 sqrtPriceX96) external {
+        manager.initialize(key, sqrtPriceX96);
+    }
+}
+
 /// @notice Lifecycle tests for the hook against a real PoolManager: initialization, buys, blocked sells,
 /// votes, the one-hour window and the 50% allowance.
 contract BuyGateHookTest is Test {
@@ -256,7 +266,7 @@ contract BuyGateHookTest is Test {
         assertEq(PoolId.unwrap(hook.poolId()), PoolId.unwrap(poolId));
         assertEq(address(hook.token()), address(token));
         assertEq(hook.genesis(), START);
-        assertEq(hook.initializer(), address(this), "the caller of initialize is the launch");
+        assertEq(hook.initializer(), address(this), "the caller of initialize is recorded");
         assertTrue(hook.seeded(), "setUp added the first position");
         assertEq(hook.currentDay(), 0);
         assertFalse(hook.sellWindowOpen());
@@ -463,7 +473,7 @@ contract BuyGateHookTest is Test {
 
     function test_thirdPartyCannotAddLiquidityAfterTheSeed() public {
         // The pool is seeded (setUp). A holder who tries to add through the same router is refused: the
-        // router is not the initializer, the pool is seeded and this is not the initialization transaction.
+        // pool is seeded and this is not the initialization transaction.
         token.transfer(alice, 1_000 ether);
         vm.deal(alice, 10 ether);
         vm.startPrank(alice);
@@ -477,12 +487,66 @@ contract BuyGateHookTest is Test {
         vm.stopPrank();
         assertEq(token.balanceOf(alice), 1_000 ether, "nothing left the holder");
 
-        // The launch itself cannot add through a third-party router either: the hook cannot tell the
-        // callers of a shared router apart, so only the initializer's own calls count.
+        // The launch itself cannot add after the seed either, through any router: the hook cannot tell
+        // the callers of a shared router apart, so it admits nobody once the initialization transaction ends.
         expectLiquidityRefused(address(lpRouter));
         lpRouter.modifyLiquidity{value: 1 ether}(
             key, ModifyLiquidityParams(MIN_TICK, MAX_TICK, 1 ether, bytes32(0)), ""
         );
+    }
+
+    function test_usersOfTheRouterThatInitializedThePoolAreRefusedAfterTheSeed() public {
+        // The independent review's scenario: the launch initializes and seeds through a router that anyone
+        // can drive (PositionManager.initializePool then modifyLiquidities). A rule keyed on the router that
+        // called `initialize` would admit every user of that router; the hook keys on nothing of the kind,
+        // so a stranger's position through the launch router is refused and the single-sided exit stays shut.
+        PoolManager freshManager = new PoolManager(address(this));
+        BuyGateHook freshHook = deployer.deployHook(IPoolManager(address(freshManager)), address(deployer));
+        SharedLaunchRouter shared = new SharedLaunchRouter(IPoolManager(address(freshManager)));
+        PoolSwapTest freshSwap = new PoolSwapTest(IPoolManager(address(freshManager)));
+        PoolKey memory k = PoolKey({
+            currency0: CurrencyLibrary.ADDRESS_ZERO,
+            currency1: Currency.wrap(address(token)),
+            fee: 3_000,
+            tickSpacing: 60,
+            hooks: IHooks(address(freshHook))
+        });
+
+        // Launch: initialize, then seed in a later call, both through the shared router.
+        shared.initializePool(k, SQRT_PRICE_1_1);
+        token.approve(address(shared), type(uint256).max);
+        shared.modifyLiquidity{value: 10_100 ether}(
+            k, ModifyLiquidityParams(MIN_TICK, MAX_TICK, 10_000 ether, bytes32(0)), ""
+        );
+        assertEq(freshHook.initializer(), address(shared), "the shared router is what initialize saw");
+        assertTrue(freshHook.seeded());
+
+        // A stranger parks SURF just below the price through the very same router: refused.
+        token.transfer(alice, 1_000 ether);
+        vm.deal(bob, 10_000 ether);
+        uint256 aliceEthBefore = alice.balance;
+        vm.startPrank(alice);
+        token.approve(address(shared), type(uint256).max);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                CustomRevert.WrappedError.selector,
+                address(freshHook),
+                IHooks.beforeAddLiquidity.selector,
+                abi.encodeWithSelector(BuyGateHook.LiquidityNotFromLaunch.selector, address(shared)),
+                abi.encodeWithSelector(Hooks.HookCallFailed.selector)
+            )
+        );
+        shared.modifyLiquidity(k, ModifyLiquidityParams(-60, 0, 333_000 ether, bytes32(0)), "");
+        vm.stopPrank();
+
+        // A buy walks the price down through launch liquidity only; nothing reaches the stranger.
+        vm.prank(bob);
+        freshSwap.swap{value: 2_000 ether}(
+            k, SwapParams(true, -1_200 ether, TickMath.MIN_SQRT_PRICE + 1), PoolSwapTest.TestSettings(false, false), ""
+        );
+        assertEq(alice.balance, aliceEthBefore, "no ETH reached the stranger");
+        assertEq(token.balanceOf(alice), 1_000 ether, "the stranger still has every token");
+        assertFalse(freshHook.sellWindowOpen());
     }
 
     function test_holderCannotExitThroughASingleSidedPositionWhileSellsAreClosed() public {
@@ -566,12 +630,23 @@ contract BuyGateHookTest is Test {
         assertTrue(freshHook.seeded());
         assertGt(token.balanceOf(address(freshManager)), 0);
 
-        // Later, the launch may still add as its own router...
+        // Later, not even the factory may add, acting as its own router: the hook does not know whether a
+        // router's later calls come from the launch or from anyone else, so it admits nobody after the
+        // initialization transaction.
         ModifyLiquidityParams[] memory more = new ModifyLiquidityParams[](1);
         more[0] = ModifyLiquidityParams(MIN_TICK, -60, 1_000 ether, bytes32(uint256(1)));
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                CustomRevert.WrappedError.selector,
+                address(freshHook),
+                IHooks.beforeAddLiquidity.selector,
+                abi.encodeWithSelector(BuyGateHook.LiquidityNotFromLaunch.selector, address(factory)),
+                abi.encodeWithSelector(Hooks.HookCallFailed.selector)
+            )
+        );
         factory.addLater(k, more);
 
-        // ...but nobody else may, and the flag did not leak out of the initialization transaction.
+        // Nobody else may either, and the flag did not leak out of the initialization transaction.
         PoolModifyLiquidityTest freshLp = new PoolModifyLiquidityTest(IPoolManager(address(freshManager)));
         token.approve(address(freshLp), type(uint256).max);
         vm.expectRevert(
@@ -629,8 +704,8 @@ contract BuyGateHookTest is Test {
 
     function test_launchCanRemoveAndReaddItsLiquidity() public {
         // Removal is not gated: the launch unwinds through the router that holds its position. Re-adding
-        // through that router is refused like any other third-party add, so the launch should keep its
-        // position or act as its own router (see the factory test).
+        // through that router is refused like any other add after the seed, so the launch should size its
+        // seed once and keep it.
         uint256 ethBefore = address(this).balance;
         uint256 tokensBefore = token.balanceOf(address(this));
         lpRouter.modifyLiquidity(key, ModifyLiquidityParams(MIN_TICK, MAX_TICK, -5_000 ether, bytes32(0)), "");
