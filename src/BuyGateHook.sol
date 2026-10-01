@@ -10,6 +10,7 @@ import {Currency, CurrencyLibrary} from "v4-core/src/types/Currency.sol";
 import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "v4-core/src/types/BeforeSwapDelta.sol";
 import {ModifyLiquidityParams, SwapParams} from "v4-core/src/types/PoolOperation.sol";
+import {Lock} from "v4-core/src/libraries/Lock.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 /// @title BuyGateHook
@@ -30,7 +31,16 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 /// `[genesis + d days, genesis + (d + 1) days)` and the sell window of day `d` is its first hour.
 ///
 /// Votes are weighted by tokens the voter has deposited into this contract. A deposit that voted today is
-/// locked until the day ends, so the same tokens cannot vote twice in one day from two addresses.
+/// locked until the day ends, so the same tokens cannot vote twice in one day from two addresses. A vote
+/// is refused while the pool manager is unlocked, because the quorum snapshot reads the manager's token
+/// balance and that balance can be moved freely inside an unlock.
+///
+/// Liquidity is the launch's alone. A position just below the price is a resting sell order that a buy
+/// fills, so an open pool would let any holder turn tokens into ETH with no vote, no window and no cap,
+/// and would let a holder inflate "bought" by buying from their own position. `beforeAddLiquidity`
+/// therefore accepts a position only from the launch: during the transaction that initialized the pool,
+/// from the account that initialized it, or as the pool's very first position. Removing liquidity is not
+/// restricted: only the launch can have any.
 ///
 /// The hook charges nothing, overrides no LP fee and returns no deltas. The pool keeps its ordinary
 /// 0.3% LP fee (`fee` 3000, `tickSpacing` 60), which goes to liquidity providers as on any pool. Nobody can
@@ -64,6 +74,12 @@ contract BuyGateHook is IHooks {
     /// @notice The only tick spacing the hook accepts at initialization.
     int24 public constant POOL_TICK_SPACING = 60;
 
+    /// @dev Transient slot that is non-zero for the rest of the transaction that initialized the pool.
+    /// Transient storage starts every transaction at zero, so no later transaction can reproduce it.
+    /// Value: `bytes32(uint256(keccak256("BuyGateHook.initializing")) - 1)`, spelled out because inline
+    /// assembly only accepts literal constants.
+    bytes32 private constant INITIALIZING_SLOT = 0x0fff2561bcab1d02c072205a567a00fb4a1ea4b4b7282575981b59ff68913127;
+
     // ---------------------------------------------------------------------------------------------
     // Storage
     // ---------------------------------------------------------------------------------------------
@@ -79,6 +95,12 @@ contract BuyGateHook is IHooks {
 
     /// @notice The timestamp the governed pool was initialized at; day 0 starts here.
     uint256 public genesis;
+
+    /// @notice The account that initialized the pool (the launch); it may add liquidity at any time.
+    address public initializer;
+
+    /// @notice True once the pool holds its first position. From then on only the launch may add.
+    bool public seeded;
 
     /// @notice Everything the hook tracks about one day.
     /// @param yes      weight that voted to open sells on the next day
@@ -102,8 +124,8 @@ contract BuyGateHook is IHooks {
     /// @notice Tokens each voter has deposited and not withdrawn.
     mapping(address voter => uint256) public stakeOf;
 
-    /// @notice Day index plus one of the voter's last vote (zero means never voted).
-    mapping(address voter => uint256) private _lastVoteDayPlusOne;
+    /// @notice Whether the voter has cast a vote on a given day.
+    mapping(address voter => mapping(uint256 day => bool)) private _voted;
 
     /// @notice Earliest timestamp at which the voter may withdraw again.
     mapping(address voter => uint256) public lockedUntil;
@@ -112,7 +134,8 @@ contract BuyGateHook is IHooks {
     // Events and errors
     // ---------------------------------------------------------------------------------------------
 
-    event PoolBound(PoolId indexed poolId, address indexed token, uint256 genesis);
+    event PoolBound(PoolId indexed poolId, address indexed token, uint256 genesis, address initializer);
+    event Seeded(address indexed sender);
     event Deposited(address indexed voter, uint256 amount);
     event Withdrawn(address indexed voter, uint256 amount);
     event VoteCast(uint256 indexed day, address indexed voter, bool support, uint256 weight);
@@ -127,6 +150,8 @@ contract BuyGateHook is IHooks {
     error WrongFee(uint24 fee);
     error WrongTickSpacing(int24 tickSpacing);
     error QuoteMustBeNativeEth();
+    error LiquidityNotFromLaunch(address sender);
+    error ManagerUnlocked();
     error SellsClosed();
     error SellAllowanceExceeded(uint256 requested, uint256 remaining);
     error ZeroAmount();
@@ -158,7 +183,7 @@ contract BuyGateHook is IHooks {
         return Hooks.Permissions({
             beforeInitialize: true,
             afterInitialize: false,
-            beforeAddLiquidity: false,
+            beforeAddLiquidity: true,
             afterAddLiquidity: false,
             beforeRemoveLiquidity: false,
             afterRemoveLiquidity: false,
@@ -180,8 +205,10 @@ contract BuyGateHook is IHooks {
     /// @inheritdoc IHooks
     /// @dev Binds the hook to its one pool. The pool must pair native ETH (`currency0`) with the token
     /// (`currency1`) at the standard 0.3% static fee and tick spacing 60. A second initialization is
-    /// refused, so no other pool can ever share this hook's accounting.
-    function beforeInitialize(address, PoolKey calldata key, uint160) external onlyPoolManager returns (bytes4) {
+    /// refused, so no other pool can ever share this hook's accounting. The caller of `initialize` is
+    /// recorded as the launch, and the rest of this transaction is marked as the initialization
+    /// transaction, during which any router may seed liquidity.
+    function beforeInitialize(address sender, PoolKey calldata key, uint160) external onlyPoolManager returns (bytes4) {
         if (genesis != 0) revert AlreadyBound();
         if (key.fee != POOL_FEE) revert WrongFee(key.fee);
         if (key.tickSpacing != POOL_TICK_SPACING) revert WrongTickSpacing(key.tickSpacing);
@@ -191,9 +218,33 @@ contract BuyGateHook is IHooks {
         poolId = id;
         token = IERC20(Currency.unwrap(key.currency1));
         genesis = block.timestamp;
-        emit PoolBound(id, Currency.unwrap(key.currency1), block.timestamp);
+        initializer = sender;
+        assembly ("memory-safe") {
+            tstore(INITIALIZING_SLOT, 1)
+        }
+        emit PoolBound(id, Currency.unwrap(key.currency1), block.timestamp, sender);
 
         return IHooks.beforeInitialize.selector;
+    }
+
+    /// @inheritdoc IHooks
+    /// @dev Only the launch may add liquidity. A position is accepted when any of these hold:
+    ///   - the call is in the transaction that initialized the pool (the factory seeds right after it);
+    ///   - `sender` is the account that initialized the pool, acting as its own router;
+    ///   - the pool has never held a position (the seed arrives in a later transaction).
+    /// Every accepted position marks the pool as seeded, which closes the third case for good.
+    function beforeAddLiquidity(address sender, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata)
+        external
+        onlyPoolManager
+        returns (bytes4)
+    {
+        if (genesis == 0) revert NotBound();
+        if (!_inInitializationTransaction() && sender != initializer && seeded) revert LiquidityNotFromLaunch(sender);
+        if (!seeded) {
+            seeded = true;
+            emit Seeded(sender);
+        }
+        return IHooks.beforeAddLiquidity.selector;
     }
 
     /// @inheritdoc IHooks
@@ -281,13 +332,17 @@ contract BuyGateHook is IHooks {
 
     /// @notice Votes with the caller's whole deposit on whether tomorrow starts with a sell window.
     /// @dev One vote per address per day, weighted by the deposit at the time of the call. The deposit is
-    /// locked until the day ends. The first vote of a day snapshots the quorum from the circulating supply.
+    /// locked until the day ends. The first vote of a day snapshots the quorum from the circulating supply,
+    /// so voting is refused while the pool manager is unlocked: inside an unlock anyone can `take` the
+    /// manager's whole token balance for the duration of the call and settle it back afterwards, which
+    /// would let a single wei of stake snapshot a quorum of 5% of the total supply.
     /// @param support true to open sells for the first hour of the next day
     function vote(bool support) external {
         uint256 day = currentDay();
         uint256 weight = stakeOf[msg.sender];
         if (weight == 0) revert NoStake();
-        if (_lastVoteDayPlusOne[msg.sender] == day + 1) revert AlreadyVoted(day);
+        if (_voted[msg.sender][day]) revert AlreadyVoted(day);
+        if (poolManager.exttload(Lock.IS_UNLOCKED_SLOT) != bytes32(0)) revert ManagerUnlocked();
 
         DayRecord storage record = records[day];
         if (!record.hasVotes) {
@@ -300,7 +355,7 @@ contract BuyGateHook is IHooks {
         if (support) record.yes += weight;
         else record.no += weight;
 
-        _lastVoteDayPlusOne[msg.sender] = day + 1;
+        _voted[msg.sender][day] = true;
         lockedUntil[msg.sender] = dayStart(day + 1);
         emit VoteCast(day, msg.sender, support, weight);
     }
@@ -321,13 +376,15 @@ contract BuyGateHook is IHooks {
         return genesis + day * DAY;
     }
 
-    /// @notice True when the voter already voted on `day`.
+    /// @notice True when the voter cast a vote on `day`, for any past or current day.
     function hasVoted(address voter, uint256 day) external view returns (bool) {
-        return _lastVoteDayPlusOne[voter] == day + 1;
+        return _voted[voter][day];
     }
 
     /// @notice Tokens held outside the pool manager: total supply minus the manager's balance.
-    /// @dev Deposits held by this contract count as circulating; they belong to voters.
+    /// @dev Deposits held by this contract count as circulating; they belong to voters. The manager's
+    /// balance covers every pool and every ERC-6909 claim on it, not only this pool, and it can be moved
+    /// while the manager is unlocked, which is why `vote` refuses to snapshot it then.
     function circulatingSupply() public view returns (uint256) {
         if (genesis == 0) revert NotBound();
         return token.totalSupply() - token.balanceOf(address(poolManager));
@@ -376,22 +433,21 @@ contract BuyGateHook is IHooks {
         remaining = sold >= allowance ? 0 : allowance - sold;
     }
 
+    /// @dev True for the rest of the transaction in which `beforeInitialize` ran.
+    function _inInitializationTransaction() internal view returns (bool initializing) {
+        assembly ("memory-safe") {
+            initializing := tload(INITIALIZING_SLOT)
+        }
+    }
+
     // ---------------------------------------------------------------------------------------------
     // Callbacks this hook does not implement; the address carries no bit for them, so the pool
-    // manager never calls them. They revert so a direct call cannot pretend otherwise.
+    // manager never calls them. They revert so a direct call cannot pretend otherwise. Removing
+    // liquidity is deliberately among them: only the launch can hold a position, and it may unwind it.
     // ---------------------------------------------------------------------------------------------
 
     /// @inheritdoc IHooks
     function afterInitialize(address, PoolKey calldata, uint160, int24) external pure returns (bytes4) {
-        revert HookNotImplemented();
-    }
-
-    /// @inheritdoc IHooks
-    function beforeAddLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata)
-        external
-        pure
-        returns (bytes4)
-    {
         revert HookNotImplemented();
     }
 

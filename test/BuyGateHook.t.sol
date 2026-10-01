@@ -17,11 +17,53 @@ import {ModifyLiquidityParams, SwapParams} from "v4-core/src/types/PoolOperation
 import {PoolSwapTest} from "v4-core/src/test/PoolSwapTest.sol";
 import {PoolModifyLiquidityTest} from "v4-core/src/test/PoolModifyLiquidityTest.sol";
 
+import {IUnlockCallback} from "v4-core/src/interfaces/callback/IUnlockCallback.sol";
+
 import {SurfToken} from "../src/SurfToken.sol";
 import {BuyGateHook} from "../src/BuyGateHook.sol";
 import {HookFlags} from "../src/HookFlags.sol";
 import {Deploy} from "../script/Deploy.s.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
+import {MockLaunchFactory} from "./mocks/MockLaunchFactory.sol";
+
+/// @notice A voter that tries to cast its vote inside a PoolManager unlock, after flash-taking every token
+/// the manager holds so that the quorum snapshot would see a manager balance of zero.
+contract FlashVoter is IUnlockCallback {
+    PoolManager immutable manager;
+    SurfToken immutable token;
+    BuyGateHook immutable hook;
+
+    constructor(PoolManager _manager, SurfToken _token, BuyGateHook _hook) {
+        manager = _manager;
+        token = _token;
+        hook = _hook;
+    }
+
+    function prepare() external {
+        token.approve(address(hook), 1);
+        hook.deposit(1);
+    }
+
+    function voteWhileUnlocked(bool support) external {
+        manager.unlock(abi.encode(support));
+    }
+
+    function voteLocked(bool support) external {
+        hook.vote(support);
+    }
+
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        require(msg.sender == address(manager));
+        Currency surf = Currency.wrap(address(token));
+        uint256 amount = token.balanceOf(address(manager));
+        manager.take(surf, address(this), amount);
+        hook.vote(abi.decode(data, (bool))); // reverts: the hook refuses to vote while the manager is unlocked
+        manager.sync(surf);
+        token.transfer(address(manager), amount);
+        manager.settle();
+        return "";
+    }
+}
 
 /// @notice Lifecycle tests for the hook against a real PoolManager: initialization, buys, blocked sells,
 /// votes, the one-hour window and the 50% allowance.
@@ -157,16 +199,18 @@ contract BuyGateHookTest is Test {
     // ---------------------------------------------------------------------------------------------
 
     function test_addressCarriesExactlyTheDeclaredFlags() public view {
-        uint160 expected = HookFlags.BEFORE_INITIALIZE | HookFlags.BEFORE_SWAP | HookFlags.AFTER_SWAP;
+        uint160 expected =
+            HookFlags.BEFORE_INITIALIZE | HookFlags.BEFORE_ADD_LIQUIDITY | HookFlags.BEFORE_SWAP | HookFlags.AFTER_SWAP;
+        assertEq(expected, 0x28C0);
         assertEq(HookFlags.flagsOf(address(hook)), expected);
         assertEq(deployer.hookFlags(), expected);
 
         Hooks.Permissions memory p = hook.getHookPermissions();
         assertTrue(p.beforeInitialize);
+        assertTrue(p.beforeAddLiquidity);
         assertTrue(p.beforeSwap);
         assertTrue(p.afterSwap);
         assertFalse(p.afterInitialize);
-        assertFalse(p.beforeAddLiquidity);
         assertFalse(p.afterAddLiquidity);
         assertFalse(p.beforeRemoveLiquidity);
         assertFalse(p.afterRemoveLiquidity);
@@ -212,6 +256,8 @@ contract BuyGateHookTest is Test {
         assertEq(PoolId.unwrap(hook.poolId()), PoolId.unwrap(poolId));
         assertEq(address(hook.token()), address(token));
         assertEq(hook.genesis(), START);
+        assertEq(hook.initializer(), address(this), "the caller of initialize is the launch");
+        assertTrue(hook.seeded(), "setUp added the first position");
         assertEq(hook.currentDay(), 0);
         assertFalse(hook.sellWindowOpen());
         assertEq(hook.sellRemaining(), 0);
@@ -305,6 +351,9 @@ contract BuyGateHookTest is Test {
         hook.beforeInitialize(address(this), key, SQRT_PRICE_1_1);
 
         vm.expectRevert(BuyGateHook.NotPoolManager.selector);
+        hook.beforeAddLiquidity(address(this), key, ModifyLiquidityParams(-60, 60, 1 ether, bytes32(0)), "");
+
+        vm.expectRevert(BuyGateHook.NotPoolManager.selector);
         hook.beforeSwap(address(this), key, SwapParams(true, -1 ether, TickMath.MIN_SQRT_PRICE + 1), "");
 
         vm.expectRevert(BuyGateHook.NotPoolManager.selector);
@@ -318,7 +367,14 @@ contract BuyGateHookTest is Test {
         vm.expectRevert(BuyGateHook.HookNotImplemented.selector);
         hook.afterInitialize(address(this), key, SQRT_PRICE_1_1, 0);
         vm.expectRevert(BuyGateHook.HookNotImplemented.selector);
-        hook.beforeAddLiquidity(address(this), key, ModifyLiquidityParams(-60, 60, 1, bytes32(0)), "");
+        hook.afterAddLiquidity(
+            address(this),
+            key,
+            ModifyLiquidityParams(-60, 60, 1, bytes32(0)),
+            BalanceDelta.wrap(0),
+            BalanceDelta.wrap(0),
+            ""
+        );
         vm.expectRevert(BuyGateHook.HookNotImplemented.selector);
         hook.beforeRemoveLiquidity(address(this), key, ModifyLiquidityParams(-60, 60, -1, bytes32(0)), "");
         vm.expectRevert(BuyGateHook.HookNotImplemented.selector);
@@ -395,6 +451,215 @@ contract BuyGateHookTest is Test {
     }
 
     // ---------------------------------------------------------------------------------------------
+    // Liquidity belongs to the launch
+    // ---------------------------------------------------------------------------------------------
+
+    function expectLiquidityRefused(address sender) internal {
+        expectHookRevert(
+            IHooks.beforeAddLiquidity.selector,
+            abi.encodeWithSelector(BuyGateHook.LiquidityNotFromLaunch.selector, sender)
+        );
+    }
+
+    function test_thirdPartyCannotAddLiquidityAfterTheSeed() public {
+        // The pool is seeded (setUp). A holder who tries to add through the same router is refused: the
+        // router is not the initializer, the pool is seeded and this is not the initialization transaction.
+        token.transfer(alice, 1_000 ether);
+        vm.deal(alice, 10 ether);
+        vm.startPrank(alice);
+        token.approve(address(lpRouter), type(uint256).max);
+        expectLiquidityRefused(address(lpRouter));
+        lpRouter.modifyLiquidity(key, ModifyLiquidityParams(-60, 0, 333_000 ether, bytes32(0)), "");
+        expectLiquidityRefused(address(lpRouter));
+        lpRouter.modifyLiquidity{value: 1 ether}(
+            key, ModifyLiquidityParams(MIN_TICK, MAX_TICK, 1 ether, bytes32(0)), ""
+        );
+        vm.stopPrank();
+        assertEq(token.balanceOf(alice), 1_000 ether, "nothing left the holder");
+
+        // The launch itself cannot add through a third-party router either: the hook cannot tell the
+        // callers of a shared router apart, so only the initializer's own calls count.
+        expectLiquidityRefused(address(lpRouter));
+        lpRouter.modifyLiquidity{value: 1 ether}(
+            key, ModifyLiquidityParams(MIN_TICK, MAX_TICK, 1 ether, bytes32(0)), ""
+        );
+    }
+
+    function test_holderCannotExitThroughASingleSidedPositionWhileSellsAreClosed() public {
+        // The reviewers' scenario: park SURF just below the price as a resting sell order, let a buy fill
+        // it, remove the position and walk away with ETH. The add is refused, so nothing of the kind happens.
+        token.transfer(alice, 1_000 ether);
+        vm.deal(bob, 10_000 ether);
+        uint256 aliceEthBefore = alice.balance;
+
+        vm.startPrank(alice);
+        token.approve(address(lpRouter), type(uint256).max);
+        expectLiquidityRefused(address(lpRouter));
+        lpRouter.modifyLiquidity(key, ModifyLiquidityParams(-60, 0, 333_000 ether, bytes32(0)), "");
+        vm.stopPrank();
+
+        vm.prank(bob);
+        swapRouter.swap{value: 2_000 ether}(
+            key,
+            SwapParams(true, -1_200 ether, TickMath.MIN_SQRT_PRICE + 1),
+            PoolSwapTest.TestSettings(false, false),
+            ""
+        );
+
+        assertEq(alice.balance, aliceEthBefore, "no ETH reached the holder");
+        assertEq(token.balanceOf(alice), 1_000 ether, "the holder still has every token");
+        assertFalse(hook.sellWindowOpen());
+    }
+
+    function test_selfLiquidityWashCannotInflateBought() public {
+        // The reviewers' scenario: add a dense SURF-only position one spacing below the price, buy through
+        // it with a price limit at its lower edge, remove it in the same breath. With the add refused, the
+        // buy only takes what the launch liquidity sells in that range and `bought` equals exactly that.
+        token.transfer(alice, 1_000_000 ether);
+        vm.deal(alice, 2_000_000 ether);
+        uint256 managerSurfBefore = token.balanceOf(address(manager));
+
+        vm.startPrank(alice);
+        token.approve(address(lpRouter), type(uint256).max);
+        expectLiquidityRefused(address(lpRouter));
+        lpRouter.modifyLiquidity(key, ModifyLiquidityParams(-60, 0, 333_000_000 ether, bytes32(0)), "");
+
+        BalanceDelta delta = swapRouter.swap{value: 1_100_000 ether}(
+            key,
+            SwapParams(true, -1_050_000 ether, TickMath.getSqrtPriceAtTick(-60)),
+            PoolSwapTest.TestSettings(false, false),
+            ""
+        );
+        vm.stopPrank();
+
+        uint256 out = uint256(int256(delta.amount1()));
+        uint256 netOut = managerSurfBefore - token.balanceOf(address(manager));
+        (,,,, uint256 bought,) = hook.records(0);
+        assertEq(bought, out);
+        assertEq(bought, netOut, "every token counted as bought really left the pool");
+        assertLt(bought, 100 ether, "a tick-spacing worth of launch liquidity, not a million tokens");
+        assertEq(hook.sellAllowance(1), bought / 2);
+    }
+
+    function test_launchSeedsSeveralPositionsInTheInitializationTransaction() public {
+        // The way the factory does it: initialize and seed in one transaction, as its own router. The
+        // transient initialization flag admits every position in that transaction, even with a router the
+        // hook has never seen.
+        PoolManager freshManager = new PoolManager(address(this));
+        BuyGateHook freshHook = deployer.deployHook(IPoolManager(address(freshManager)), address(deployer));
+        MockLaunchFactory factory = new MockLaunchFactory(IPoolManager(address(freshManager)));
+        token.transfer(address(factory), 1_000_000 ether);
+        PoolKey memory k = PoolKey({
+            currency0: CurrencyLibrary.ADDRESS_ZERO,
+            currency1: Currency.wrap(address(token)),
+            fee: 3_000,
+            tickSpacing: 60,
+            hooks: IHooks(address(freshHook))
+        });
+
+        ModifyLiquidityParams[] memory seed = new ModifyLiquidityParams[](2);
+        seed[0] = ModifyLiquidityParams(MIN_TICK, -60, 400_000 ether, bytes32(0));
+        seed[1] = ModifyLiquidityParams(-6_000, -60, 1_000 ether, bytes32(0));
+        factory.launch(k, SQRT_PRICE_1_1, seed);
+
+        assertEq(freshHook.initializer(), address(factory));
+        assertTrue(freshHook.seeded());
+        assertGt(token.balanceOf(address(freshManager)), 0);
+
+        // Later, the launch may still add as its own router...
+        ModifyLiquidityParams[] memory more = new ModifyLiquidityParams[](1);
+        more[0] = ModifyLiquidityParams(MIN_TICK, -60, 1_000 ether, bytes32(uint256(1)));
+        factory.addLater(k, more);
+
+        // ...but nobody else may, and the flag did not leak out of the initialization transaction.
+        PoolModifyLiquidityTest freshLp = new PoolModifyLiquidityTest(IPoolManager(address(freshManager)));
+        token.approve(address(freshLp), type(uint256).max);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                CustomRevert.WrappedError.selector,
+                address(freshHook),
+                IHooks.beforeAddLiquidity.selector,
+                abi.encodeWithSelector(BuyGateHook.LiquidityNotFromLaunch.selector, address(freshLp)),
+                abi.encodeWithSelector(Hooks.HookCallFailed.selector)
+            )
+        );
+        freshLp.modifyLiquidity(k, ModifyLiquidityParams(-60, 0, 1_000 ether, bytes32(0)), "");
+
+        // Buys still work on the factory-seeded pool.
+        PoolSwapTest freshSwap = new PoolSwapTest(IPoolManager(address(freshManager)));
+        BalanceDelta delta = freshSwap.swap{value: 1 ether}(
+            k, SwapParams(true, -1 ether, TickMath.MIN_SQRT_PRICE + 1), PoolSwapTest.TestSettings(false, false), ""
+        );
+        assertGt(uint256(int256(delta.amount1())), 0);
+    }
+
+    function test_firstPositionIsAcceptedFromAnyRouterOnlyOnce() public {
+        // Seed in a later transaction through a shared router: the pool's first position is accepted
+        // (this is what setUp relies on); a second position from the same router is not.
+        PoolManager freshManager = new PoolManager(address(this));
+        BuyGateHook freshHook = deployer.deployHook(IPoolManager(address(freshManager)), address(deployer));
+        PoolModifyLiquidityTest freshLp = new PoolModifyLiquidityTest(IPoolManager(address(freshManager)));
+        PoolKey memory k = PoolKey({
+            currency0: CurrencyLibrary.ADDRESS_ZERO,
+            currency1: Currency.wrap(address(token)),
+            fee: 3_000,
+            tickSpacing: 60,
+            hooks: IHooks(address(freshHook))
+        });
+        freshManager.initialize(k, SQRT_PRICE_1_1);
+        assertFalse(freshHook.seeded());
+
+        token.approve(address(freshLp), type(uint256).max);
+        vm.expectEmit(true, false, false, true, address(freshHook));
+        emit BuyGateHook.Seeded(address(freshLp));
+        freshLp.modifyLiquidity(k, ModifyLiquidityParams(MIN_TICK, -60, 1_000 ether, bytes32(0)), "");
+        assertTrue(freshHook.seeded());
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                CustomRevert.WrappedError.selector,
+                address(freshHook),
+                IHooks.beforeAddLiquidity.selector,
+                abi.encodeWithSelector(BuyGateHook.LiquidityNotFromLaunch.selector, address(freshLp)),
+                abi.encodeWithSelector(Hooks.HookCallFailed.selector)
+            )
+        );
+        freshLp.modifyLiquidity(k, ModifyLiquidityParams(MIN_TICK, -60, 1_000 ether, bytes32(0)), "");
+    }
+
+    function test_launchCanRemoveAndReaddItsLiquidity() public {
+        // Removal is not gated: the launch unwinds through the router that holds its position. Re-adding
+        // through that router is refused like any other third-party add, so the launch should keep its
+        // position or act as its own router (see the factory test).
+        uint256 ethBefore = address(this).balance;
+        uint256 tokensBefore = token.balanceOf(address(this));
+        lpRouter.modifyLiquidity(key, ModifyLiquidityParams(MIN_TICK, MAX_TICK, -5_000 ether, bytes32(0)), "");
+        assertGt(address(this).balance, ethBefore);
+        assertGt(token.balanceOf(address(this)), tokensBefore);
+
+        expectLiquidityRefused(address(lpRouter));
+        lpRouter.modifyLiquidity{value: 5_100 ether}(
+            key, ModifyLiquidityParams(MIN_TICK, MAX_TICK, 5_000 ether, bytes32(0)), ""
+        );
+    }
+
+    function testFuzz_thirdPartyPositionsAreAlwaysRefused(int24 lower, int24 upper, uint128 liquidity) public {
+        lower = int24(bound(int256(lower), MIN_TICK / 60, MAX_TICK / 60 - 1)) * 60;
+        upper = int24(bound(int256(upper), int256(lower) / 60 + 1, MAX_TICK / 60)) * 60;
+        liquidity = uint128(bound(liquidity, 1, 1_000_000 ether));
+
+        token.transfer(alice, 1_000_000 ether);
+        vm.deal(alice, 1_000_000 ether);
+        vm.startPrank(alice);
+        token.approve(address(lpRouter), type(uint256).max);
+        expectLiquidityRefused(address(lpRouter));
+        lpRouter.modifyLiquidity{value: 1_000_000 ether}(
+            key, ModifyLiquidityParams(lower, upper, int256(uint256(liquidity)), bytes32(0)), ""
+        );
+        vm.stopPrank();
+    }
+
+    // ---------------------------------------------------------------------------------------------
     // Sells are closed by default
     // ---------------------------------------------------------------------------------------------
 
@@ -452,6 +717,7 @@ contract BuyGateHookTest is Test {
 
     function test_voteOncePerDayAndLockedUntilDayEnds() public {
         giveStake(alice, 100 ether);
+        assertFalse(hook.hasVoted(alice, 0));
         vm.prank(alice);
         hook.vote(true);
         assertTrue(hook.hasVoted(alice, 0));
@@ -471,6 +737,64 @@ contract BuyGateHookTest is Test {
         hook.withdraw(100 ether);
         assertEq(token.balanceOf(alice), 100 ether);
         assertFalse(hook.hasVoted(alice, 1));
+    }
+
+    function test_hasVotedRemembersEveryDayAVoterVotedOn() public {
+        giveStake(alice, 10 ether);
+        vm.prank(alice);
+        hook.vote(true);
+        warpToDay(1, 0);
+        vm.prank(alice);
+        hook.vote(false);
+        warpToDay(2, 0);
+
+        assertTrue(hook.hasVoted(alice, 0), "day 0 is still tallied");
+        assertTrue(hook.hasVoted(alice, 1));
+        assertFalse(hook.hasVoted(alice, 2));
+        assertFalse(hook.hasVoted(bob, 0));
+        (uint256 yes0,,,,,) = hook.records(0);
+        (, uint256 no1,,,,) = hook.records(1);
+        assertEq(yes0, 10 ether);
+        assertEq(no1, 10 ether);
+
+        // Still one vote per day: day 2 accepts exactly one more.
+        vm.prank(alice);
+        hook.vote(true);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(BuyGateHook.AlreadyVoted.selector, 2));
+        hook.vote(true);
+    }
+
+    function test_voteIsRefusedWhileTheManagerIsUnlocked() public {
+        // A griefer with 1 wei of stake flash-takes every SURF the manager holds inside an unlock and tries
+        // to cast the day's first vote, which would snapshot the quorum from a manager balance of zero.
+        FlashVoter griefer = new FlashVoter(manager, token, hook);
+        token.transfer(address(griefer), 1);
+        griefer.prepare();
+
+        uint256 managerBalance = token.balanceOf(address(manager));
+        vm.expectRevert(BuyGateHook.ManagerUnlocked.selector);
+        griefer.voteWhileUnlocked(false);
+        assertEq(token.balanceOf(address(manager)), managerBalance, "the revert undid the flash take");
+
+        (,, uint256 quorum, bool hasVotes,,) = hook.records(0);
+        assertFalse(hasVotes, "no vote was recorded");
+        assertEq(quorum, 0);
+
+        // The same griefer votes fine once the manager is locked again, and the snapshot is honest.
+        uint256 circulating = token.totalSupply() - token.balanceOf(address(manager));
+        griefer.voteLocked(false);
+        (,, quorum, hasVotes,,) = hook.records(0);
+        assertTrue(hasVotes);
+        assertEq(quorum, circulating * hook.QUORUM_BPS() / hook.BPS());
+
+        // A yes vote that clears the honest quorum opens the window.
+        giveStake(alice, stakeAboveQuorum());
+        vm.prank(alice);
+        hook.vote(true);
+        assertTrue(hook.votePassed(0));
+        warpToDay(1, 0);
+        assertTrue(hook.sellWindowOpen());
     }
 
     function test_voteWeightIsTheStakeAtVoteTime() public {

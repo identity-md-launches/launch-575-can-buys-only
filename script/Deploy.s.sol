@@ -23,12 +23,13 @@ contract Deploy is Script {
     uint256 public constant ANVIL = 31337;
     uint256 public constant SEPOLIA = 11_155_111;
 
-    /// @notice How many salts to try before giving up; 3 fixed bits out of 14 need ~16k on average.
+    /// @notice How many salts to try before giving up; matching all 14 bits needs ~16k on average.
     uint256 public constant MAX_SALT_TRIES = 500_000;
 
-    /// @notice The permission bits the hook's address must carry.
+    /// @notice The permission bits the hook's address must carry: `0x28C0`.
     function hookFlags() public pure returns (uint160) {
-        return HookFlags.BEFORE_INITIALIZE | HookFlags.BEFORE_SWAP | HookFlags.AFTER_SWAP;
+        return
+            HookFlags.BEFORE_INITIALIZE | HookFlags.BEFORE_ADD_LIQUIDITY | HookFlags.BEFORE_SWAP | HookFlags.AFTER_SWAP;
     }
 
     function run() external returns (SurfToken token, BuyGateHook hook) {
