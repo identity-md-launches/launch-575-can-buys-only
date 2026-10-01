@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
-import {Test} from "forge-std/Test.sol";
+import {Test, StdStorage, stdStorage} from "forge-std/Test.sol";
 import {PoolManager} from "v4-core/src/PoolManager.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
+import {IUnlockCallback} from "v4-core/src/interfaces/callback/IUnlockCallback.sol";
 import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
 import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 import {CustomRevert} from "v4-core/src/libraries/CustomRevert.sol";
@@ -23,17 +24,58 @@ import {SurfToken} from "../src/SurfToken.sol";
 import {BuyGateHook} from "../src/BuyGateHook.sol";
 import {Deploy} from "../script/Deploy.s.sol";
 
+/// @notice A voter contract that acts from inside a PoolManager unlock: deposits, withdraws or votes
+/// while the manager is unlocked, without taking anything from it. Used to pin which governance calls
+/// the unlock guard refuses (only `vote`) and which it leaves alone.
+contract UnlockActor is IUnlockCallback {
+    PoolManager immutable manager;
+    SurfToken immutable token;
+    BuyGateHook immutable hook;
+
+    enum Action {
+        Deposit,
+        Withdraw,
+        Vote
+    }
+
+    constructor(PoolManager _manager, SurfToken _token, BuyGateHook _hook) {
+        manager = _manager;
+        token = _token;
+        hook = _hook;
+        token.approve(address(hook), type(uint256).max);
+    }
+
+    function depositLocked(uint256 amount) external {
+        hook.deposit(amount);
+    }
+
+    function act(Action action, uint256 amount) external {
+        manager.unlock(abi.encode(action, amount));
+    }
+
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        require(msg.sender == address(manager));
+        (Action action, uint256 amount) = abi.decode(data, (Action, uint256));
+        if (action == Action.Deposit) hook.deposit(amount);
+        else if (action == Action.Withdraw) hook.withdraw(amount);
+        else hook.vote(true);
+        return "";
+    }
+}
+
 /// @notice Adversarial and failure-path tests for `BuyGateHook`, beside the lifecycle suite in
 /// `BuyGateHook.t.sol`: inputs the implementation did not obviously consider (zero, one wei, exact
 /// boundaries, the same call twice, a caller the code did not expect, partial fills, claims-settled
 /// swaps) and the arithmetic of the quorum and the allowance at its edges.
 ///
-/// Two defects found while writing this file are NOT asserted here; they are reported in
-/// `.imd-findings.json` with runnable proofs: a holder can sell SURF for ETH through a one-sided
-/// liquidity position while sells are closed, and `hasVoted(voter, day)` forgets every day but the last.
+/// The two defects reported from the first version of this file (the one-sided liquidity exit and the
+/// forgetful `hasVoted`) were fixed in the implementation's revision: `beforeAddLiquidity` now gates
+/// positions and `hasVoted` keeps every day. The tests at the end of this file probe that new surface
+/// from the side the launch does not control: strangers, hook data, an emptied pool, an unlock callback.
 /// forge-config: default.fuzz.runs = 512
 contract BuyGateHookEdgeTest is Test {
     using StateLibrary for IPoolManager;
+    using stdStorage for StdStorage;
 
     uint160 constant SQRT_PRICE_1_1 = 79228162514264337593543950336;
     uint256 constant START = 1_800_000_000;
@@ -766,15 +808,19 @@ contract BuyGateHookEdgeTest is Test {
     // Allowance arithmetic at the top of the range
     // ---------------------------------------------------------------------------------------------
 
-    /// @dev `records` is the fourth storage slot (poolId, token, genesis, records); `bought` is field 4.
-    function boughtSlot(uint256 day) internal pure returns (bytes32) {
-        return bytes32(uint256(keccak256(abi.encode(day, uint256(3)))) + 4);
+    /// @dev Writes `records[day].bought` directly. The slot is located through the `records(uint256)`
+    /// getter (`bought` is its fifth return value, depth 4) rather than hard-coded, so a change in the
+    /// hook's storage layout, like the `initializer` and `seeded` variables the revision added ahead of
+    /// `records`, cannot silently point this at the wrong slot.
+    function setBought(uint256 day, uint256 volume) internal {
+        uint256 slot = stdstore.target(address(hook)).sig(hook.records.selector).with_key(day).depth(4).find();
+        vm.store(address(hook), bytes32(slot), bytes32(volume));
     }
 
     function testFuzz_allowanceIsHalfRoundedDownForAnyVolume(uint256 volume, uint256 day) public {
         volume = bound(volume, 0, type(uint256).max / 10_000);
         day = bound(day, 0, type(uint256).max - 1);
-        vm.store(address(hook), boughtSlot(day), bytes32(volume));
+        setBought(day, volume);
         assertEq(bought(day), volume, "the slot is where this test believes it is");
 
         uint256 allowance = hook.sellAllowance(day + 1);
@@ -785,8 +831,147 @@ contract BuyGateHookEdgeTest is Test {
     function test_allowanceOverflowsForVolumesAboveTheSupplyScale() public {
         // Unreachable with a 10^27 supply, but the formula multiplies before dividing: pinned so a
         // future change of SELL_SHARE_BPS or supply cannot drift past it unnoticed.
-        vm.store(address(hook), boughtSlot(0), bytes32(type(uint256).max / 5_000 + 1));
+        setBought(0, type(uint256).max / 5_000 + 1);
         vm.expectRevert();
         hook.sellAllowance(1);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // The liquidity gate, from the side the launch does not control
+    // ---------------------------------------------------------------------------------------------
+
+    function expectLiquidityRefused(address sender) internal {
+        expectHookRevert(
+            IHooks.beforeAddLiquidity.selector,
+            abi.encodeWithSelector(BuyGateHook.LiquidityNotFromLaunch.selector, sender)
+        );
+    }
+
+    function test_hookDataCannotImpersonateTheLaunch() public {
+        // The gate reads `sender`, which the manager sets; whatever a stranger puts in hookData is noise.
+        token.transfer(alice, 1_000 ether);
+        vm.startPrank(alice);
+        token.approve(address(lpRouter), type(uint256).max);
+        bytes[3] memory forged = [
+            abi.encode(hook.initializer()), abi.encodePacked(hook.initializer()), abi.encode(true, hook.initializer())
+        ];
+        for (uint256 i = 0; i < forged.length; i++) {
+            expectLiquidityRefused(address(lpRouter));
+            lpRouter.modifyLiquidity(key, ModifyLiquidityParams(-60, 0, 333_000 ether, bytes32(0)), forged[i]);
+        }
+        vm.stopPrank();
+        assertEq(token.balanceOf(alice), 1_000 ether);
+    }
+
+    function test_zeroLiquidityAddFromAStrangerIsRefusedToo() public {
+        // The smallest possible add. Refusing it matters: an accepted empty position would still run
+        // `beforeAddLiquidity`, and a later version that keyed anything on "has a position" would be fooled.
+        vm.prank(alice);
+        expectLiquidityRefused(address(lpRouter));
+        lpRouter.modifyLiquidity(key, ModifyLiquidityParams(-60, 0, 1, bytes32(0)), "");
+    }
+
+    function test_seededStaysTrueAfterTheLaunchRemovesEverything() public {
+        // The launch unwinds its whole position. The pool is empty, but it has held a position, so the
+        // "first position" exception does not reopen: a stranger still cannot become the pool's liquidity.
+        lpRouter.modifyLiquidity(key, ModifyLiquidityParams(MIN_TICK, MAX_TICK, -10_000 ether, bytes32(0)), "");
+        assertEq(IPoolManager(address(manager)).getLiquidity(poolId), 0, "the pool is empty");
+        assertTrue(hook.seeded(), "seeded is a latch");
+
+        token.transfer(alice, 1_000 ether);
+        vm.deal(alice, 10 ether);
+        vm.startPrank(alice);
+        token.approve(address(lpRouter), type(uint256).max);
+        expectLiquidityRefused(address(lpRouter));
+        lpRouter.modifyLiquidity{value: 1 ether}(
+            key, ModifyLiquidityParams(MIN_TICK, MAX_TICK, 1 ether, bytes32(0)), ""
+        );
+        expectLiquidityRefused(address(lpRouter));
+        lpRouter.modifyLiquidity(key, ModifyLiquidityParams(-60, 0, 333_000 ether, bytes32(0)), "");
+        vm.stopPrank();
+        assertEq(IPoolManager(address(manager)).getLiquidity(poolId), 0);
+    }
+
+    function test_beforeAddLiquidityOnAnUnboundHookRevertsNotBound() public {
+        BuyGateHook fresh = deployer.deployHook(IPoolManager(address(manager)), address(deployer));
+        vm.prank(address(manager));
+        vm.expectRevert(BuyGateHook.NotBound.selector);
+        fresh.beforeAddLiquidity(address(this), key, ModifyLiquidityParams(-60, 60, 1 ether, bytes32(0)), "");
+        assertFalse(fresh.seeded(), "a refused call does not latch seeded");
+    }
+
+    function test_strangerCannotSeedBeforeTheLaunchByFrontRunningTheInitializedPool() public {
+        // A hook bound by `initialize` alone, no seed yet: the first position is accepted from anyone (the
+        // README states this), and from then on only the initializer. Pinned so the gap stays exactly one
+        // position wide and does not widen to "anyone, until the initializer shows up".
+        PoolManager freshManager = new PoolManager(address(this));
+        BuyGateHook freshHook = deployer.deployHook(IPoolManager(address(freshManager)), address(deployer));
+        PoolModifyLiquidityTest freshLp = new PoolModifyLiquidityTest(IPoolManager(address(freshManager)));
+        PoolKey memory k = PoolKey({
+            currency0: CurrencyLibrary.ADDRESS_ZERO,
+            currency1: Currency.wrap(address(token)),
+            fee: 3_000,
+            tickSpacing: 60,
+            hooks: IHooks(address(freshHook))
+        });
+        freshManager.initialize(k, SQRT_PRICE_1_1);
+
+        token.transfer(alice, 2_000 ether);
+        vm.startPrank(alice);
+        token.approve(address(freshLp), type(uint256).max);
+        freshLp.modifyLiquidity(k, ModifyLiquidityParams(-60, 0, 1, bytes32(0)), "");
+        assertTrue(freshHook.seeded());
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                CustomRevert.WrappedError.selector,
+                address(freshHook),
+                IHooks.beforeAddLiquidity.selector,
+                abi.encodeWithSelector(BuyGateHook.LiquidityNotFromLaunch.selector, address(freshLp)),
+                abi.encodeWithSelector(Hooks.HookCallFailed.selector)
+            )
+        );
+        freshLp.modifyLiquidity(k, ModifyLiquidityParams(-60, 0, 333_000 ether, bytes32(0)), "");
+        vm.stopPrank();
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // The unlock guard: only `vote` is refused inside an unlock, and it is refused even when nothing
+    // was taken from the manager
+    // ---------------------------------------------------------------------------------------------
+
+    function test_voteInsideAnUnlockIsRefusedEvenWithoutAFlashTake() public {
+        UnlockActor actor = new UnlockActor(manager, token, hook);
+        token.transfer(address(actor), 10 ether);
+        actor.depositLocked(10 ether);
+
+        vm.expectRevert(BuyGateHook.ManagerUnlocked.selector);
+        actor.act(UnlockActor.Action.Vote, 0);
+        (,,, bool hasVotes,,) = hook.records(0);
+        assertFalse(hasVotes);
+        assertFalse(hook.hasVoted(address(actor), 0));
+        assertEq(hook.lockedUntil(address(actor)), 0, "a refused vote locks nothing");
+    }
+
+    function test_depositAndWithdrawInsideAnUnlockAreAllowedAndChangeNoTally() public {
+        UnlockActor actor = new UnlockActor(manager, token, hook);
+        token.transfer(address(actor), 10 ether);
+
+        actor.act(UnlockActor.Action.Deposit, 10 ether);
+        assertEq(hook.stakeOf(address(actor)), 10 ether);
+        actor.act(UnlockActor.Action.Withdraw, 4 ether);
+        assertEq(hook.stakeOf(address(actor)), 6 ether);
+        assertEq(token.balanceOf(address(actor)), 4 ether);
+        assertEq(token.balanceOf(address(hook)), 6 ether);
+
+        (,,, bool hasVotes, uint256 boughtToday, uint256 soldToday) = hook.records(0);
+        assertFalse(hasVotes);
+        assertEq(boughtToday, 0);
+        assertEq(soldToday, 0);
+
+        // Outside the unlock the same contract votes with what it kept.
+        vm.prank(address(actor));
+        hook.vote(true);
+        (uint256 yes,,,,,) = hook.records(0);
+        assertEq(yes, 6 ether);
     }
 }

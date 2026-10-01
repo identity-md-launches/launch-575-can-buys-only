@@ -4,7 +4,10 @@ pragma solidity 0.8.26;
 import {Test} from "forge-std/Test.sol";
 import {PoolManager} from "v4-core/src/PoolManager.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
+import {IUnlockCallback} from "v4-core/src/interfaces/callback/IUnlockCallback.sol";
 import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
+import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
+import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
 import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 import {CustomRevert} from "v4-core/src/libraries/CustomRevert.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
@@ -22,19 +25,26 @@ import {BuyGateHook} from "../src/BuyGateHook.sol";
 import {Deploy} from "../script/Deploy.s.sol";
 
 /// @notice Drives the hook, the pool and three actors through random sequences of buys, sells (both
-/// exact-input and exact-output), deposits, withdrawals, votes, ERC-6909 parking and time travel.
+/// exact-input and exact-output), deposits, withdrawals, votes, ERC-6909 parking, stranger liquidity
+/// attempts, flash votes from inside an unlock, and time travel.
 /// Every call that the rules say must fail is attempted anyway and its revert is checked; every call
 /// that must succeed is asserted to. Ghost variables record what the hook should hold and what each
 /// day's tallies and volumes should be, from bookkeeping independent of the hook's own storage.
-contract BuyGateHandler is Test {
+/// The handler itself holds a one-wei stake, deposited in its constructor, which it only ever tries to
+/// vote with from inside an unlock; that vote must always be refused.
+contract BuyGateHandler is Test, IUnlockCallback {
     PoolManager public manager;
     SurfToken public token;
     BuyGateHook public hook;
     PoolKey public key;
     PoolSwapTest public swapRouter;
     PoolClaimsTest public claimsRouter;
+    PoolModifyLiquidityTest public lpRouter;
 
     address[3] public actors;
+
+    /// @notice The handler's own stake, used only for flash-vote attempts.
+    uint256 public constant HANDLER_STAKE = 1;
 
     // ---- ghosts: stake custody ----
     mapping(address => uint256) public ghostDeposited;
@@ -70,6 +80,8 @@ contract BuyGateHandler is Test {
     uint256 public countVotesOk;
     uint256 public countWithdrawLocked;
     uint256 public countOpenAtSell;
+    uint256 public countLiquidityRefused;
+    uint256 public countFlashVotesRefused;
 
     constructor(
         PoolManager _manager,
@@ -78,6 +90,7 @@ contract BuyGateHandler is Test {
         PoolKey memory _key,
         PoolSwapTest _swapRouter,
         PoolClaimsTest _claimsRouter,
+        PoolModifyLiquidityTest _lpRouter,
         address[3] memory _actors
     ) {
         manager = _manager;
@@ -86,9 +99,20 @@ contract BuyGateHandler is Test {
         key = _key;
         swapRouter = _swapRouter;
         claimsRouter = _claimsRouter;
+        lpRouter = _lpRouter;
         actors = _actors;
         managerEthAtStart = address(manager).balance;
         managerTokenAtStart = token.balanceOf(address(manager));
+    }
+
+    /// @notice Deposits the handler's own one-wei stake. Called once from `setUp`, after the handler was
+    /// sent HANDLER_STAKE tokens and before it becomes a fuzz target (it is not in the selector list).
+    function stakeSelf() external {
+        require(ghostDeposited[address(this)] == 0, "already staked");
+        token.approve(address(hook), HANDLER_STAKE);
+        hook.deposit(HANDLER_STAKE);
+        ghostDeposited[address(this)] = HANDLER_STAKE;
+        ghostSumStake += HANDLER_STAKE;
     }
 
     receive() external payable {}
@@ -394,6 +418,65 @@ contract BuyGateHandler is Test {
     }
 
     // ---------------------------------------------------------------------------------------------
+    // Strangers at the liquidity gate: every add from an actor is refused, whatever the range or size
+    // ---------------------------------------------------------------------------------------------
+
+    function addLiquidityAsStranger(uint256 actorSeed, int24 lowerSeed, int24 upperSeed, uint128 liquiditySeed) public {
+        address actor = _actor(actorSeed);
+        int24 lower = int24(bound(int256(lowerSeed), -887_220 / 60, 887_220 / 60 - 1)) * 60;
+        int24 upper = int24(bound(int256(upperSeed), int256(lower) / 60 + 1, 887_220 / 60)) * 60;
+        uint256 liquidity = bound(uint256(liquiditySeed), 1, 1_000_000 ether);
+        uint256 tokensBefore = token.balanceOf(actor);
+        uint256 ethBefore = actor.balance;
+
+        vm.prank(actor);
+        (bool ok, bytes memory ret) = address(lpRouter)
+            .call(
+                abi.encodeWithSignature(
+                    "modifyLiquidity((address,address,uint24,int24,address),(int24,int24,int256,bytes32),bytes)",
+                    key,
+                    ModifyLiquidityParams(lower, upper, int256(liquidity), bytes32(0)),
+                    ""
+                )
+            );
+        assertFalse(ok, "a stranger added liquidity to the launch pool");
+        (bytes4 cb, bytes4 reason) = _hookReason(ret);
+        assertEq(cb, IHooks.beforeAddLiquidity.selector);
+        assertEq(reason, BuyGateHook.LiquidityNotFromLaunch.selector);
+        assertEq(token.balanceOf(actor), tokensBefore, "a refused add moved tokens");
+        assertEq(actor.balance, ethBefore, "a refused add moved ETH");
+        countLiquidityRefused++;
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // A vote from inside an unlock, after flash-taking every token the manager holds: always refused,
+    // and the day's record is untouched by it
+    // ---------------------------------------------------------------------------------------------
+
+    function flashVote(bool support) public {
+        manager.unlock(abi.encode(support));
+    }
+
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        assertEq(msg.sender, address(manager));
+        bool support = abi.decode(data, (bool));
+        uint256 amount = token.balanceOf(address(manager));
+        if (amount > 0) manager.take(key.currency1, address(this), amount);
+
+        (bool ok, bytes memory ret) = address(hook).call(abi.encodeCall(hook.vote, (support)));
+        assertFalse(ok, "a vote was accepted while the manager was unlocked");
+        assertEq(bytes4(ret), BuyGateHook.ManagerUnlocked.selector);
+
+        if (amount > 0) {
+            manager.sync(key.currency1);
+            token.transfer(address(manager), amount);
+            manager.settle();
+        }
+        countFlashVotesRefused++;
+        return "";
+    }
+
+    // ---------------------------------------------------------------------------------------------
     // Time
     // ---------------------------------------------------------------------------------------------
 
@@ -420,10 +503,14 @@ contract BuyGateHandler is Test {
 /// forge-config: default.invariant.depth = 60
 /// forge-config: default.invariant.fail-on-revert = true
 contract BuyGateHookInvariantTest is Test {
+    using StateLibrary for IPoolManager;
+    using PoolIdLibrary for PoolKey;
+
     uint160 constant SQRT_PRICE_1_1 = 79228162514264337593543950336;
     uint256 constant START = 1_800_000_000;
     int24 constant MIN_TICK = -887_220;
     int24 constant MAX_TICK = 887_220;
+    uint128 constant SEED_LIQUIDITY = 10_000 ether;
 
     PoolManager manager;
     SurfToken token;
@@ -432,6 +519,7 @@ contract BuyGateHookInvariantTest is Test {
     PoolModifyLiquidityTest lpRouter;
     PoolClaimsTest claimsRouter;
     PoolKey key;
+    PoolId poolId;
     BuyGateHandler handler;
 
     address[3] actors = [makeAddr("actor0"), makeAddr("actor1"), makeAddr("actor2")];
@@ -458,12 +546,13 @@ contract BuyGateHookInvariantTest is Test {
             tickSpacing: 60,
             hooks: IHooks(address(hook))
         });
+        poolId = key.toId();
         manager.initialize(key, SQRT_PRICE_1_1);
 
         token.approve(address(lpRouter), type(uint256).max);
         vm.deal(address(this), 20_000 ether);
         lpRouter.modifyLiquidity{value: 10_100 ether}(
-            key, ModifyLiquidityParams(MIN_TICK, MAX_TICK, 10_000 ether, bytes32(0)), ""
+            key, ModifyLiquidityParams(MIN_TICK, MAX_TICK, int256(uint256(SEED_LIQUIDITY)), bytes32(0)), ""
         );
 
         // Holdings large enough that one or two actors can reach the 5% quorum (about 50M SURF).
@@ -478,9 +567,16 @@ contract BuyGateHookInvariantTest is Test {
             vm.stopPrank();
         }
 
-        handler = new BuyGateHandler(manager, token, hook, key, swapRouter, claimsRouter, actors);
+        handler = new BuyGateHandler(manager, token, hook, key, swapRouter, claimsRouter, lpRouter, actors);
+        // The handler's own one-wei stake, which it only ever tries to vote with from inside an unlock.
+        token.transfer(address(handler), handler.HANDLER_STAKE());
+        handler.stakeSelf();
+        for (uint256 i = 0; i < actors.length; i++) {
+            vm.prank(actors[i]);
+            token.approve(address(lpRouter), type(uint256).max);
+        }
 
-        bytes4[] memory selectors = new bytes4[](12);
+        bytes4[] memory selectors = new bytes4[](14);
         selectors[0] = BuyGateHandler.buy.selector;
         selectors[1] = BuyGateHandler.sellExactIn.selector;
         selectors[2] = BuyGateHandler.sellExactOut.selector;
@@ -493,6 +589,8 @@ contract BuyGateHookInvariantTest is Test {
         selectors[9] = BuyGateHandler.warp.selector;
         selectors[10] = BuyGateHandler.warpToNextWindow.selector;
         selectors[11] = BuyGateHandler.prepareWindow.selector;
+        selectors[12] = BuyGateHandler.addLiquidityAsStranger.selector;
+        selectors[13] = BuyGateHandler.flashVote.selector;
         targetContract(address(handler));
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
     }
@@ -502,12 +600,28 @@ contract BuyGateHookInvariantTest is Test {
     // ---------------------------------------------------------------------------------------------
 
     function invariant_hookHoldsExactlyTheStakes() public view {
-        uint256 sum;
+        uint256 sum = hook.stakeOf(address(handler));
         for (uint256 i = 0; i < actors.length; i++) {
             sum += hook.stakeOf(actors[i]);
         }
         assertEq(token.balanceOf(address(hook)), sum, "hook token balance != sum of stakes");
         assertEq(sum, handler.ghostSumStake(), "sum of stakes != deposits - withdrawals");
+        assertEq(hook.stakeOf(address(handler)), handler.HANDLER_STAKE(), "the handler's stake never moves");
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Liquidity: the launch's seed is the pool's only liquidity, whatever the actors try
+    // ---------------------------------------------------------------------------------------------
+
+    function invariant_poolLiquidityIsOnlyTheLaunchSeed() public view {
+        assertEq(IPoolManager(address(manager)).getLiquidity(poolId), SEED_LIQUIDITY, "pool liquidity changed");
+        assertTrue(hook.seeded());
+        assertEq(hook.initializer(), address(this), "the initializer is whoever called initialize");
+    }
+
+    function invariant_flashVotesLeaveNoTrace() public view {
+        assertFalse(hook.hasVoted(address(handler), hook.currentDay()), "a flash vote was recorded");
+        assertEq(hook.lockedUntil(address(handler)), 0, "a flash vote locked the handler's stake");
     }
 
     function invariant_eachStakeIsDepositsMinusWithdrawals() public view {
@@ -634,6 +748,10 @@ contract BuyGateHookInvariantTest is Test {
         handler.park(1, 1_000 ether);
         handler.unpark(1, 500 ether);
         handler.withdraw(2, 1); // unlocked now
+        handler.addLiquidityAsStranger(0, -1, 0, 333_000 ether); // the resting-sell-order shape, refused
+        handler.addLiquidityAsStranger(1, type(int24).min, type(int24).max, 1); // full range, refused
+        handler.flashVote(true); // ManagerUnlocked, with the manager's whole balance flash-taken
+        handler.flashVote(false);
 
         handler.warp(2 hours);
         handler.sellExactIn(0, 1); // closed again
@@ -644,8 +762,12 @@ contract BuyGateHookInvariantTest is Test {
         assertGe(handler.countSellsOverCap(), 1);
         assertGe(handler.countVotesOk(), 1);
         assertGe(handler.countWithdrawLocked(), 1);
+        assertEq(handler.countLiquidityRefused(), 2);
+        assertEq(handler.countFlashVotesRefused(), 2);
 
         invariant_hookHoldsExactlyTheStakes();
+        invariant_poolLiquidityIsOnlyTheLaunchSeed();
+        invariant_flashVotesLeaveNoTrace();
         invariant_eachStakeIsDepositsMinusWithdrawals();
         invariant_hookTakesNothing();
         invariant_managerBalancesFollowTheSwaps();
