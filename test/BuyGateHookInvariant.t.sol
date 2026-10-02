@@ -24,9 +24,21 @@ import {SurfToken} from "../src/SurfToken.sol";
 import {BuyGateHook} from "../src/BuyGateHook.sol";
 import {Deploy} from "../script/Deploy.s.sol";
 
+/// @notice A liquidity router anyone can call that also initializes pools, like PositionManager's
+/// `initializePool`. The launch goes through it in `setUp`, so the hook records it as `initializer` and
+/// it holds the seed position; the actors then drive the very same router.
+contract LaunchRouter is PoolModifyLiquidityTest {
+    constructor(IPoolManager m) PoolModifyLiquidityTest(m) {}
+
+    function initializePool(PoolKey calldata key, uint160 sqrtPriceX96) external {
+        manager.initialize(key, sqrtPriceX96);
+    }
+}
+
 /// @notice Drives the hook, the pool and three actors through random sequences of buys, sells (both
 /// exact-input and exact-output), deposits, withdrawals, votes, ERC-6909 parking, stranger liquidity
-/// attempts, flash votes from inside an unlock, and time travel.
+/// attempts through a third-party router and through the router that initialized and seeded the pool,
+/// flash votes from inside an unlock, and time travel.
 /// Every call that the rules say must fail is attempted anyway and its revert is checked; every call
 /// that must succeed is asserted to. Ghost variables record what the hook should hold and what each
 /// day's tallies and volumes should be, from bookkeeping independent of the hook's own storage.
@@ -40,8 +52,14 @@ contract BuyGateHandler is Test, IUnlockCallback {
     PoolSwapTest public swapRouter;
     PoolClaimsTest public claimsRouter;
     PoolModifyLiquidityTest public lpRouter;
+    LaunchRouter public launchRouter;
 
     address[3] public actors;
+
+    /// @notice The launch's seed position, keyed under `launchRouter`: the one position a stranger could
+    /// top up by calling that router with the same ticks and salt.
+    int24 public constant SEED_LOWER = -887_220;
+    int24 public constant SEED_UPPER = 887_220;
 
     /// @notice The handler's own stake, used only for flash-vote attempts.
     uint256 public constant HANDLER_STAKE = 1;
@@ -81,6 +99,7 @@ contract BuyGateHandler is Test, IUnlockCallback {
     uint256 public countWithdrawLocked;
     uint256 public countOpenAtSell;
     uint256 public countLiquidityRefused;
+    uint256 public countLaunchRouterRefused;
     uint256 public countFlashVotesRefused;
 
     constructor(
@@ -91,6 +110,7 @@ contract BuyGateHandler is Test, IUnlockCallback {
         PoolSwapTest _swapRouter,
         PoolClaimsTest _claimsRouter,
         PoolModifyLiquidityTest _lpRouter,
+        LaunchRouter _launchRouter,
         address[3] memory _actors
     ) {
         manager = _manager;
@@ -100,6 +120,7 @@ contract BuyGateHandler is Test, IUnlockCallback {
         swapRouter = _swapRouter;
         claimsRouter = _claimsRouter;
         lpRouter = _lpRouter;
+        launchRouter = _launchRouter;
         actors = _actors;
         managerEthAtStart = address(manager).balance;
         managerTokenAtStart = token.balanceOf(address(manager));
@@ -448,6 +469,52 @@ contract BuyGateHandler is Test, IUnlockCallback {
         countLiquidityRefused++;
     }
 
+    /// @notice The same attempt through the router that initialized and seeded the pool, which the manager
+    /// reports as `sender == initializer`. Half of the attempts aim at the launch's own position key (same
+    /// ticks, salt zero), which would top it up; the rest open a position of the actor's own under that
+    /// router. Every one of them must be refused: the revision removed the initializer's privilege because
+    /// a shared router's users cannot be told apart.
+    function addLiquidityThroughTheLaunchRouter(
+        uint256 actorSeed,
+        int24 lowerSeed,
+        int24 upperSeed,
+        uint128 liquiditySeed,
+        bool aimAtSeedPosition
+    ) public {
+        address actor = _actor(actorSeed);
+        int24 lower;
+        int24 upper;
+        bytes32 salt;
+        if (aimAtSeedPosition) {
+            (lower, upper, salt) = (SEED_LOWER, SEED_UPPER, bytes32(0));
+        } else {
+            lower = int24(bound(int256(lowerSeed), -887_220 / 60, 887_220 / 60 - 1)) * 60;
+            upper = int24(bound(int256(upperSeed), int256(lower) / 60 + 1, 887_220 / 60)) * 60;
+            salt = bytes32(uint256(uint160(actor)));
+        }
+        uint256 liquidity = bound(uint256(liquiditySeed), 1, 1_000_000 ether);
+        uint256 tokensBefore = token.balanceOf(actor);
+        uint256 ethBefore = actor.balance;
+
+        vm.prank(actor);
+        (bool ok, bytes memory ret) = address(launchRouter)
+            .call(
+                abi.encodeWithSignature(
+                    "modifyLiquidity((address,address,uint24,int24,address),(int24,int24,int256,bytes32),bytes)",
+                    key,
+                    ModifyLiquidityParams(lower, upper, int256(liquidity), salt),
+                    ""
+                )
+            );
+        assertFalse(ok, "a stranger added liquidity through the router that initialized the pool");
+        (bytes4 cb, bytes4 reason) = _hookReason(ret);
+        assertEq(cb, IHooks.beforeAddLiquidity.selector);
+        assertEq(reason, BuyGateHook.LiquidityNotFromLaunch.selector);
+        assertEq(token.balanceOf(actor), tokensBefore, "a refused add moved tokens");
+        assertEq(actor.balance, ethBefore, "a refused add moved ETH");
+        countLaunchRouterRefused++;
+    }
+
     // ---------------------------------------------------------------------------------------------
     // A vote from inside an unlock, after flash-taking every token the manager holds: always refused,
     // and the day's record is untouched by it
@@ -518,6 +585,7 @@ contract BuyGateHookInvariantTest is Test {
     PoolSwapTest swapRouter;
     PoolModifyLiquidityTest lpRouter;
     PoolClaimsTest claimsRouter;
+    LaunchRouter launchRouter;
     PoolKey key;
     PoolId poolId;
     BuyGateHandler handler;
@@ -538,6 +606,7 @@ contract BuyGateHookInvariantTest is Test {
         swapRouter = new PoolSwapTest(IPoolManager(address(manager)));
         lpRouter = new PoolModifyLiquidityTest(IPoolManager(address(manager)));
         claimsRouter = new PoolClaimsTest(IPoolManager(address(manager)));
+        launchRouter = new LaunchRouter(IPoolManager(address(manager)));
 
         key = PoolKey({
             currency0: CurrencyLibrary.ADDRESS_ZERO,
@@ -547,11 +616,13 @@ contract BuyGateHookInvariantTest is Test {
             hooks: IHooks(address(hook))
         });
         poolId = key.toId();
-        manager.initialize(key, SQRT_PRICE_1_1);
 
-        token.approve(address(lpRouter), type(uint256).max);
+        // The launch initializes and seeds through a shared router, the way a position manager is used,
+        // so `initializer()` names a contract every actor can drive and the seed is a position under it.
+        launchRouter.initializePool(key, SQRT_PRICE_1_1);
+        token.approve(address(launchRouter), type(uint256).max);
         vm.deal(address(this), 20_000 ether);
-        lpRouter.modifyLiquidity{value: 10_100 ether}(
+        launchRouter.modifyLiquidity{value: 10_100 ether}(
             key, ModifyLiquidityParams(MIN_TICK, MAX_TICK, int256(uint256(SEED_LIQUIDITY)), bytes32(0)), ""
         );
 
@@ -567,16 +638,19 @@ contract BuyGateHookInvariantTest is Test {
             vm.stopPrank();
         }
 
-        handler = new BuyGateHandler(manager, token, hook, key, swapRouter, claimsRouter, lpRouter, actors);
+        handler =
+            new BuyGateHandler(manager, token, hook, key, swapRouter, claimsRouter, lpRouter, launchRouter, actors);
         // The handler's own one-wei stake, which it only ever tries to vote with from inside an unlock.
         token.transfer(address(handler), handler.HANDLER_STAKE());
         handler.stakeSelf();
         for (uint256 i = 0; i < actors.length; i++) {
-            vm.prank(actors[i]);
+            vm.startPrank(actors[i]);
             token.approve(address(lpRouter), type(uint256).max);
+            token.approve(address(launchRouter), type(uint256).max);
+            vm.stopPrank();
         }
 
-        bytes4[] memory selectors = new bytes4[](14);
+        bytes4[] memory selectors = new bytes4[](15);
         selectors[0] = BuyGateHandler.buy.selector;
         selectors[1] = BuyGateHandler.sellExactIn.selector;
         selectors[2] = BuyGateHandler.sellExactOut.selector;
@@ -591,6 +665,7 @@ contract BuyGateHookInvariantTest is Test {
         selectors[11] = BuyGateHandler.prepareWindow.selector;
         selectors[12] = BuyGateHandler.addLiquidityAsStranger.selector;
         selectors[13] = BuyGateHandler.flashVote.selector;
+        selectors[14] = BuyGateHandler.addLiquidityThroughTheLaunchRouter.selector;
         targetContract(address(handler));
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
     }
@@ -615,8 +690,11 @@ contract BuyGateHookInvariantTest is Test {
 
     function invariant_poolLiquidityIsOnlyTheLaunchSeed() public view {
         assertEq(IPoolManager(address(manager)).getLiquidity(poolId), SEED_LIQUIDITY, "pool liquidity changed");
+        (uint128 seedPosition,,) = IPoolManager(address(manager))
+            .getPositionInfo(poolId, address(launchRouter), MIN_TICK, MAX_TICK, bytes32(0));
+        assertEq(seedPosition, SEED_LIQUIDITY, "the launch's position under the shared router was topped up");
         assertTrue(hook.seeded());
-        assertEq(hook.initializer(), address(this), "the initializer is whoever called initialize");
+        assertEq(hook.initializer(), address(launchRouter), "the initializer is the router that called initialize");
     }
 
     function invariant_flashVotesLeaveNoTrace() public view {
@@ -658,7 +736,7 @@ contract BuyGateHookInvariantTest is Test {
         uint256 total = token.balanceOf(address(this)) + token.balanceOf(address(hook))
             + token.balanceOf(address(manager)) + token.balanceOf(address(handler))
             + token.balanceOf(address(swapRouter)) + token.balanceOf(address(claimsRouter))
-            + token.balanceOf(address(lpRouter));
+            + token.balanceOf(address(lpRouter)) + token.balanceOf(address(launchRouter));
         for (uint256 i = 0; i < actors.length; i++) {
             total += token.balanceOf(actors[i]);
         }
@@ -750,6 +828,8 @@ contract BuyGateHookInvariantTest is Test {
         handler.withdraw(2, 1); // unlocked now
         handler.addLiquidityAsStranger(0, -1, 0, 333_000 ether); // the resting-sell-order shape, refused
         handler.addLiquidityAsStranger(1, type(int24).min, type(int24).max, 1); // full range, refused
+        handler.addLiquidityThroughTheLaunchRouter(0, 0, 0, 1, true); // top-up of the seed position, refused
+        handler.addLiquidityThroughTheLaunchRouter(2, -1, 0, 333_000 ether, false); // own position, refused
         handler.flashVote(true); // ManagerUnlocked, with the manager's whole balance flash-taken
         handler.flashVote(false);
 
@@ -763,6 +843,7 @@ contract BuyGateHookInvariantTest is Test {
         assertGe(handler.countVotesOk(), 1);
         assertGe(handler.countWithdrawLocked(), 1);
         assertEq(handler.countLiquidityRefused(), 2);
+        assertEq(handler.countLaunchRouterRefused(), 2);
         assertEq(handler.countFlashVotesRefused(), 2);
 
         invariant_hookHoldsExactlyTheStakes();

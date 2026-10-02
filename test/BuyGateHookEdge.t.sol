@@ -63,6 +63,16 @@ contract UnlockActor is IUnlockCallback {
     }
 }
 
+/// @notice A liquidity router anyone can call that also initializes pools, like PositionManager's
+/// `initializePool`. When a launch goes through it, the hook records it as `initializer`.
+contract InitializingRouter is PoolModifyLiquidityTest {
+    constructor(IPoolManager m) PoolModifyLiquidityTest(m) {}
+
+    function initializePool(PoolKey calldata key, uint160 sqrtPriceX96) external {
+        manager.initialize(key, sqrtPriceX96);
+    }
+}
+
 /// @notice Adversarial and failure-path tests for `BuyGateHook`, beside the lifecycle suite in
 /// `BuyGateHook.t.sol`: inputs the implementation did not obviously consider (zero, one wei, exact
 /// boundaries, the same call twice, a caller the code did not expect, partial fills, claims-settled
@@ -70,8 +80,9 @@ contract UnlockActor is IUnlockCallback {
 ///
 /// The two defects reported from the first version of this file (the one-sided liquidity exit and the
 /// forgetful `hasVoted`) were fixed in the implementation's revision: `beforeAddLiquidity` now gates
-/// positions and `hasVoted` keeps every day. The tests at the end of this file probe that new surface
-/// from the side the launch does not control: strangers, hook data, an emptied pool, an unlock callback.
+/// positions and `hasVoted` keeps every day. The second revision dropped the gate's trust in the router
+/// that called `initialize`. The tests at the end of this file probe that surface from the side the launch
+/// does not control: strangers, hook data, an emptied pool, the initializing router, an unlock callback.
 /// forge-config: default.fuzz.runs = 512
 contract BuyGateHookEdgeTest is Test {
     using StateLibrary for IPoolManager;
@@ -848,7 +859,8 @@ contract BuyGateHookEdgeTest is Test {
     }
 
     function test_hookDataCannotImpersonateTheLaunch() public {
-        // The gate reads `sender`, which the manager sets; whatever a stranger puts in hookData is noise.
+        // The gate reads neither hookData nor, since the revision, `sender`: whatever a stranger puts in
+        // hookData is noise, and naming the recorded initializer there earns nothing.
         token.transfer(alice, 1_000 ether);
         vm.startPrank(alice);
         token.approve(address(lpRouter), type(uint256).max);
@@ -902,8 +914,9 @@ contract BuyGateHookEdgeTest is Test {
 
     function test_strangerCannotSeedBeforeTheLaunchByFrontRunningTheInitializedPool() public {
         // A hook bound by `initialize` alone, no seed yet: the first position is accepted from anyone (the
-        // README states this), and from then on only the initializer. Pinned so the gap stays exactly one
-        // position wide and does not widen to "anyone, until the initializer shows up".
+        // README states this), and from then on nobody. Pinned so the gap stays exactly one position wide
+        // and does not widen to "anyone, until the launch shows up". The consequence for the launch, that
+        // its own seed is refused after such a front-run, is reported in `.imd-findings.json`, not asserted.
         PoolManager freshManager = new PoolManager(address(this));
         BuyGateHook freshHook = deployer.deployHook(IPoolManager(address(freshManager)), address(deployer));
         PoolModifyLiquidityTest freshLp = new PoolModifyLiquidityTest(IPoolManager(address(freshManager)));
@@ -932,6 +945,62 @@ contract BuyGateHookEdgeTest is Test {
         );
         freshLp.modifyLiquidity(k, ModifyLiquidityParams(-60, 0, 333_000 ether, bytes32(0)), "");
         vm.stopPrank();
+    }
+
+    /// @dev The revision dropped the `sender == initializer` clause. A position is keyed on (router, ticks,
+    /// salt), so when the launch initializes and seeds through a router other people can drive, a stranger
+    /// calling the same router with the same ticks and salt would be topping up the launch's own position,
+    /// and the manager would report it as `sender == initializer`. Both that stranger and the launch itself
+    /// must be refused after the seed: the hook cannot tell them apart, so it admits neither.
+    function test_launchPositionCannotBeToppedUpThroughTheRouterThatInitializedThePool() public {
+        PoolManager freshManager = new PoolManager(address(this));
+        BuyGateHook freshHook = deployer.deployHook(IPoolManager(address(freshManager)), address(deployer));
+        InitializingRouter shared = new InitializingRouter(IPoolManager(address(freshManager)));
+        PoolKey memory k = PoolKey({
+            currency0: CurrencyLibrary.ADDRESS_ZERO,
+            currency1: Currency.wrap(address(token)),
+            fee: 3_000,
+            tickSpacing: 60,
+            hooks: IHooks(address(freshHook))
+        });
+        PoolId freshId = k.toId();
+
+        // The launch (this contract) initializes and seeds through the shared router, in two transactions.
+        shared.initializePool(k, SQRT_PRICE_1_1);
+        token.approve(address(shared), type(uint256).max);
+        shared.modifyLiquidity(k, ModifyLiquidityParams(MIN_TICK, -60, 10_000 ether, bytes32(0)), "");
+        assertEq(freshHook.initializer(), address(shared));
+        (uint128 seedLiquidity,,) =
+            IPoolManager(address(freshManager)).getPositionInfo(freshId, address(shared), MIN_TICK, -60, bytes32(0));
+        assertEq(seedLiquidity, 10_000 ether);
+
+        bytes memory refused = abi.encodeWithSelector(
+            CustomRevert.WrappedError.selector,
+            address(freshHook),
+            IHooks.beforeAddLiquidity.selector,
+            abi.encodeWithSelector(BuyGateHook.LiquidityNotFromLaunch.selector, address(shared)),
+            abi.encodeWithSelector(Hooks.HookCallFailed.selector)
+        );
+
+        // A stranger tops up the launch's exact position key through the router that initialized the pool.
+        token.transfer(alice, 1_000 ether);
+        vm.startPrank(alice);
+        token.approve(address(shared), type(uint256).max);
+        vm.expectRevert(refused);
+        shared.modifyLiquidity(k, ModifyLiquidityParams(MIN_TICK, -60, 1, bytes32(0)), "");
+        // ...and a fresh position of their own with a different salt, same router.
+        vm.expectRevert(refused);
+        shared.modifyLiquidity(k, ModifyLiquidityParams(MIN_TICK, -60, 1, bytes32(uint256(1))), "");
+        vm.stopPrank();
+
+        // The launch itself, same router, same position key: refused all the same.
+        vm.expectRevert(refused);
+        shared.modifyLiquidity(k, ModifyLiquidityParams(MIN_TICK, -60, 1 ether, bytes32(0)), "");
+
+        (uint128 after_,,) =
+            IPoolManager(address(freshManager)).getPositionInfo(freshId, address(shared), MIN_TICK, -60, bytes32(0));
+        assertEq(after_, seedLiquidity, "the seed position did not change");
+        assertEq(token.balanceOf(alice), 1_000 ether);
     }
 
     // ---------------------------------------------------------------------------------------------
